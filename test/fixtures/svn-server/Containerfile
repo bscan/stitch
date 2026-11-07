@@ -1,0 +1,10 @@
+# Apache + mod_dav_svn 1.14 serving test repositories read-only and anonymously,
+# plus the real svn client's view of them under /expected/ (see build-repo.sh).
+# Used by test/dav.test.ts: podman build -t stitch-svn-server test/fixtures/svn-server
+FROM docker.io/library/alpine:3.20
+RUN apk add --no-cache apache2 apache2-webdav mod_dav_svn subversion
+COPY build-repo.sh /build-repo.sh
+RUN sh /build-repo.sh
+COPY svn.conf /etc/apache2/conf.d/svn.conf
+EXPOSE 80
+CMD ["httpd", "-DFOREGROUND"]

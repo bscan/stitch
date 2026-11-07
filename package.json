@@ -1,0 +1,222 @@
+{
+  "name": "stitch",
+  "displayName": "Stitch",
+  "description": "Read-only file history, gutter diffs and Open Changes for SVN and Git files, opened anywhere.",
+  "version": "0.0.1",
+  "publisher": "bscan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bscan/stitch-vscode.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": false
+  },
+  "main": "./dist/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "stitch.history",
+          "name": "Stitch History"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "stitch.openChanges",
+        "title": "Open Changes",
+        "category": "Stitch",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "stitch.refresh",
+        "title": "Refresh",
+        "category": "Stitch",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "stitch.pickRef",
+        "title": "Choose Starting Branch…",
+        "category": "Stitch",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "stitch.loadMore",
+        "title": "Load More",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.diffWithPrevious",
+        "title": "Diff with Previous",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.diffFile",
+        "title": "Diff File with Previous",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.diffWithWorking",
+        "title": "Diff with Working File",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.openRevision",
+        "title": "Open This Revision",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.copyRevision",
+        "title": "Copy Revision",
+        "category": "Stitch"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "stitch.pickRef",
+          "when": "view == stitch.history && stitch.kind == git",
+          "group": "navigation@1"
+        },
+        {
+          "command": "stitch.refresh",
+          "when": "view == stitch.history",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "stitch.diffWithPrevious",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge)/",
+          "group": "1_diff@1"
+        },
+        {
+          "command": "stitch.diffWithWorking",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge)/",
+          "group": "1_diff@2"
+        },
+        {
+          "command": "stitch.openRevision",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge)/",
+          "group": "2_open@1"
+        },
+        {
+          "command": "stitch.copyRevision",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge)/",
+          "group": "3_copy@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "stitch.openChanges",
+          "when": "stitch.kind == svn"
+        },
+        {
+          "command": "stitch.loadMore",
+          "when": "false"
+        },
+        {
+          "command": "stitch.diffWithPrevious",
+          "when": "false"
+        },
+        {
+          "command": "stitch.diffWithWorking",
+          "when": "false"
+        },
+        {
+          "command": "stitch.openRevision",
+          "when": "false"
+        },
+        {
+          "command": "stitch.copyRevision",
+          "when": "false"
+        },
+        {
+          "command": "stitch.diffFile",
+          "when": "false"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "stitch.openChanges",
+          "when": "stitch.svnModified && resourceScheme == file",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Stitch",
+      "properties": {
+        "stitch.svn.urlMap": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "scope": "machine",
+          "markdownDescription": "Maps `svn://` (or `svn+ssh://`) repository URLs to the http(s) URLs history is read from. Prefixes match whole path segments, longest first, and the target's repository UUID must match the working copy's. Example: `{ \"svn://svn\": \"http://svn/repos\" }` maps `svn://svn/project` to `http://svn/repos/project`."
+        },
+        "stitch.svn.refreshInterval": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "scope": "machine",
+          "markdownDescription": "Minimum seconds between automatic SVN server queries for the same file: switching back to a file or refocusing the window within this time reuses its loaded history, and a failed server isn't asked again until it passes. **Refresh** always queries. Merge checks are done once per file per session regardless."
+        },
+        "stitch.git.path": {
+          "type": "string",
+          "default": "git",
+          "scope": "machine",
+          "description": "Path to the git executable."
+        },
+        "stitch.logLimit": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "Number of history entries loaded per page."
+        },
+        "stitch.timeoutMs": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 1000,
+          "description": "Timeout for each git command and each SVN server request, in milliseconds."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run copy-wasm && esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --sourcemap --outfile=dist/extension.js",
+    "watch": "npm run copy-wasm && esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --sourcemap --outfile=dist/extension.js --watch",
+    "copy-wasm": "node -e \"require('fs').mkdirSync('dist',{recursive:true});require('fs').copyFileSync(require.resolve('sql.js/dist/sql-wasm.wasm'),'dist/sql-wasm.wasm')\"",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "tsc -p tsconfig.test.json && mocha --timeout 60000 'out/test/**/*.test.js'",
+    "vscode:prepublish": "npm run build -- --minify",
+    "package": "vsce package --no-dependencies --out dist/"
+  },
+  "devDependencies": {
+    "@types/mocha": "10.0.10",
+    "@types/node": "20.17.10",
+    "@types/sql.js": "1.4.9",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "3.2.1",
+    "esbuild": "0.24.2",
+    "mocha": "10.8.2",
+    "typescript": "5.7.2"
+  },
+  "dependencies": {
+    "sql.js": "1.12.0"
+  }
+}

@@ -1,0 +1,510 @@
+import * as path from "path";
+import * as vscode from "vscode";
+import { fileDiff, previousDiff, Side } from "./backend";
+import { Loader, RevisionFileSystem, SCHEME, sideUri } from "./content";
+import { GitOptions } from "./git/exec";
+import { GitRepo } from "./git/gitBackend";
+import { describeError } from "./errors";
+import { CommitNode, HistoryView, Node, Target } from "./history/historyView";
+import { GitSource } from "./history/source";
+import { SvnQuickDiff } from "./quickDiff";
+import { log, setLogSink } from "./log";
+import { Resolver } from "./resolver";
+import { DavClient, RepoInfo } from "./svn/dav";
+import { SvnRepo } from "./svn/svnBackend";
+import { SvnSource } from "./svn/svnHistory";
+import { mapRepoUrl } from "./svn/urlMap";
+
+const config = () => vscode.workspace.getConfiguration("stitch");
+const timeoutMs = () => config().get<number>("timeoutMs") ?? 15000;
+/** Minimum time between automatic server queries for one file (and retries after a failure). */
+const svnIntervalMs = () => Math.max(0, config().get<number>("svn.refreshInterval") ?? 60) * 1000;
+
+function gitOptions(): GitOptions {
+  return { gitPath: config().get<string>("git.path") || "git", timeoutMs: timeoutMs() };
+}
+
+export function activate(context: vscode.ExtensionContext): void {
+  // Output panel → "Stitch": every git command and SVN request, with timings and failures.
+  const output = vscode.window.createOutputChannel("Stitch", { log: true });
+  context.subscriptions.push(output);
+  setLogSink((level, message) => output[level](message));
+  log.info(`Stitch ${context.extension.packageJSON.version} activated`);
+
+  const resolver = new Resolver();
+
+  // ---- git -----------------------------------------------------------------
+  // `rev-parse --show-toplevel --show-prefix` run in a file's own folder gives
+  // both the repo root and the file's path prefix, so results are cached per
+  // folder. Repo objects are shared per root (the content provider looks them up by root).
+  const openByDir = new Map<string, Promise<{ repo: GitRepo; prefix: string }>>();
+  const reposByRoot = new Map<string, GitRepo>();
+  const refByRoot = new Map<string, string>();
+  /** Per file: "<branch hash> <upstream hash>" when its history was loaded; a change means reload. */
+  const headByFile = new Map<string, string>();
+  const gitState = async (repo: GitRepo, ref: string) => {
+    const [head, up] = await Promise.all([repo.resolve(ref).catch(() => ""), repo.upstream(ref).catch(() => undefined)]);
+    return `${head} ${up?.hash ?? ""}`;
+  };
+
+  const openRepo = async (dir: string) => {
+    let p = openByDir.get(dir);
+    if (!p) {
+      p = GitRepo.open(dir, gitOptions).then(({ repo, prefix }) => {
+        const shared = reposByRoot.get(repo.root) ?? repo;
+        reposByRoot.set(repo.root, shared);
+        return { repo: shared, prefix };
+      });
+      p.catch(() => openByDir.delete(dir));
+      openByDir.set(dir, p);
+    }
+    return p;
+  };
+  const repoForRoot = async (root: string) => reposByRoot.get(root) ?? (await openRepo(root)).repo;
+
+  // ---- svn -----------------------------------------------------------------
+  // Working copies, by the folder holding the nearest .svn marker (the WC root
+  // for 1.7+; any versioned folder for 1.6). Shared per WC root.
+  const svnByDir = new Map<string, Promise<SvnRepo>>();
+  const svnByRoot = new Map<string, SvnRepo>();
+  const svnRepo = (dir: string) => {
+    let p = svnByDir.get(dir);
+    if (!p) {
+      p = SvnRepo.open(dir).then((repo) => {
+        const shared = svnByRoot.get(repo.root) ?? repo;
+        svnByRoot.set(repo.root, shared);
+        return shared;
+      });
+      p.catch(() => svnByDir.delete(dir));
+      svnByDir.set(dir, p);
+    }
+    return p;
+  };
+  let dav = new DavClient(timeoutMs, svnIntervalMs);
+  /**
+   * History sources per file, kept across file switches: switching back reuses the
+   * loaded history (and its merge checks) instead of asking the server again.
+   */
+  const svnSources = new Map<string, SvnSource>();
+  const svnSource = (info: RepoInfo, root: string, reposPath: string, peg: number, file: vscode.Uri) => {
+    const key = `${file.toString()}|${info.rootUrl}|${reposPath}|${peg}`;
+    let src = svnSources.get(key);
+    if (src) svnSources.delete(key); // re-inserted below: most recently used last
+    src ??= new SvnSource(dav, info, root, reposPath, peg, svnIntervalMs);
+    svnSources.set(key, src);
+    if (svnSources.size > 30) svnSources.delete(svnSources.keys().next().value as string);
+    return src;
+  };
+  /** The SVN file the editor shows, if any (for Open Changes and the modified flag). */
+  let svnCurrent: { file: vscode.Uri; repo: SvnRepo } | undefined;
+
+  const clearRepos = () => {
+    openByDir.clear();
+    reposByRoot.clear();
+    svnByDir.clear();
+    svnByRoot.clear();
+    svnSources.clear();
+    dav = new DavClient(timeoutMs, svnIntervalMs);
+  };
+
+  const history = new HistoryView(() => config().get<number>("logLimit") ?? 50);
+
+  const load: Loader = async ({ vcs, root, side, remote, keywords }) => {
+    if (vcs === "svn") {
+      if (side.kind === "base") {
+        const repo = await svnRepo(root);
+        const node = await repo.wc.node(side.path);
+        if (!node) throw new Error(`${side.path} is not versioned`);
+        return repo.original(node);
+      }
+      if (side.kind !== "rev" || !remote) throw new Error("bad svn side");
+      return dav.get(await dav.options(remote), Number(side.rev), side.path, { keywords });
+    }
+    if (side.kind !== "rev") throw new Error("git has no BASE side");
+    return (await repoForRoot(root)).show(side.rev, side.path);
+  };
+  const fsProvider = new RevisionFileSystem(load);
+
+  /** The BASE URI of an SVN file, if `root` is its working copy and svn tracks it. */
+  const svnBaseUri = async (file: vscode.Uri, root?: string) => {
+    if (file.scheme !== "file") return undefined;
+    const marker = await resolver.forFile(file.fsPath);
+    if (marker?.kind !== "svn") return undefined;
+    const repo = await svnRepo(marker.dir);
+    if (root !== undefined && repo.root !== root) return undefined; // nested working copy
+    const node = await repo.node(file.fsPath);
+    if (!node) return undefined;
+    return { repo, node, uri: sideUri("svn", repo.root, { kind: "base", path: repo.relPath(file.fsPath) }) };
+  };
+  const quickDiff = new SvnQuickDiff(async (file, root) => (await svnBaseUri(file, root).catch(() => undefined))?.uri);
+
+  const setSvnModified = (on: boolean) => void vscode.commands.executeCommand("setContext", "stitch.svnModified", on);
+  const setKind = (kind: string | undefined) => void vscode.commands.executeCommand("setContext", "stitch.kind", kind);
+
+  const updateSvnModified = async () => {
+    const cur = svnCurrent;
+    if (!cur) return setSvnModified(false);
+    const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === cur.file.toString());
+    let modified = doc?.isDirty ?? false;
+    if (!modified) {
+      try {
+        const node = await cur.repo.node(cur.file.fsPath);
+        modified = node !== undefined && (await cur.repo.isModified(cur.file.fsPath, node));
+      } catch {
+        modified = false;
+      }
+    }
+    if (svnCurrent === cur) setSvnModified(modified);
+  };
+
+  /** After an svn update/commit/revert elsewhere: re-read BASE for gutters and open diffs. Returns whether anything changed. */
+  const checkSvnMetadata = async () => {
+    let any = false;
+    for (const repo of svnByRoot.values()) {
+      if (await repo.changed()) {
+        fsProvider.baseChanged(repo.root);
+        any = true;
+      }
+    }
+    return any;
+  };
+
+  const followSvn = async (file: vscode.Uri, dir: string) => {
+    let repo: SvnRepo;
+    let node;
+    try {
+      repo = await svnRepo(dir);
+      quickDiff.ensure(repo.root);
+      node = await repo.node(file.fsPath);
+    } catch (e) {
+      svnCurrent = undefined;
+      setSvnModified(false);
+      history.showMessage(describeError(e), file);
+      return;
+    }
+    if (!node) {
+      svnCurrent = undefined;
+      setSvnModified(false);
+      history.showMessage("svn doesn't track this file (unversioned or ignored).", file);
+      return;
+    }
+    svnCurrent = { file, repo };
+    void updateSvnModified();
+    if (node.schedule === "added" || !node.reposRoot || node.reposPath === undefined || node.revision === undefined) {
+      history.showMessage("This file is scheduled for addition, so it has no history yet.", file);
+      return;
+    }
+    // History starts at the file's BASE revision, like `svn log` on a working-copy file.
+    const cur = history.current;
+    if (
+      cur?.file.toString() === file.toString() &&
+      cur.source instanceof SvnSource &&
+      cur.source.peg === node.revision &&
+      cur.source.reposPath === node.reposPath
+    ) {
+      return;
+    }
+    const mapping = mapRepoUrl(node.reposRoot, config().get<Record<string, string>>("svn.urlMap"));
+    if (mapping.kind === "http" && mapping.mapped) log.info(`${node.reposRoot} mapped to ${mapping.url} (stitch.svn.urlMap)`);
+    if (mapping.kind === "needsMapping") {
+      log.info(`${node.reposRoot}: no stitch.svn.urlMap entry, so no history`);
+      history.showAction(
+        `Add a URL mapping for ${mapping.url} to see history (click to open settings)`,
+        { command: "workbench.action.openSettings", title: "Open Settings", arguments: ["stitch.svn.urlMap"] },
+        file
+      );
+      return;
+    }
+    if (mapping.kind === "unsupported") {
+      history.showMessage(mapping.reason, file);
+      return;
+    }
+    history.showMessage("Contacting the SVN server…", file);
+    try {
+      const info = await dav.options(mapping.url);
+      if (node.uuid && info.uuid !== node.uuid) {
+        log.warn(`${mapping.url} has repository UUID ${info.uuid}; the working copy at ${repo.root} has ${node.uuid}`);
+        history.showMessage(
+          mapping.mapped
+            ? `The URL mapping for ${node.reposRoot} points at a different repository (${mapping.url} has UUID ${info.uuid}, the working copy has ${node.uuid}).`
+            : `${mapping.url} is a different repository than this working copy's (UUID ${info.uuid}, expected ${node.uuid}).`,
+          file
+        );
+        return;
+      }
+      if (svnCurrent?.file.toString() !== file.toString()) return; // the user moved on meanwhile
+      const source = svnSource(info, repo.root, node.reposPath, node.revision, file);
+      history.setTarget({ file, source, description: `${path.basename(file.fsPath)} @ r${node.revision}` });
+    } catch (e) {
+      if (svnCurrent?.file.toString() === file.toString()) history.showMessage(describeError(e), file);
+    }
+  };
+
+  /** Points the history view at a file. */
+  const follow = async (file: vscode.Uri) => {
+    if (file.scheme !== "file") return;
+    const marker = await resolver.forFile(file.fsPath);
+    if (!marker) {
+      svnCurrent = undefined;
+      setSvnModified(false);
+      setKind(undefined);
+      history.showMessage("This file isn't under version control.", file);
+      return;
+    }
+    setKind(marker.kind);
+    if (marker.kind === "svn") {
+      await followSvn(file, marker.dir);
+      return;
+    }
+    svnCurrent = undefined;
+    setSvnModified(false);
+    try {
+      const { repo, prefix } = await openRepo(path.dirname(file.fsPath));
+      const relPath = GitRepo.relPath(prefix, path.basename(file.fsPath));
+      const ref = refByRoot.get(repo.root) ?? "HEAD";
+      const cur = history.current;
+      if (cur?.file.toString() === file.toString() && cur.source instanceof GitSource && cur.source.ref === ref) return;
+      history.setTarget(gitTarget(file, repo, relPath, ref));
+      headByFile.set(file.toString(), await gitState(repo, ref));
+    } catch (e) {
+      history.showMessage(describeError(e), file);
+    }
+  };
+
+  const gitTarget = (file: vscode.Uri, repo: GitRepo, relPath: string, ref: string): Target => {
+    const name = path.basename(file.fsPath);
+    return { file, source: new GitSource(repo, relPath, ref), description: ref === "HEAD" ? name : `${name} @ ${ref}` };
+  };
+
+  const followActive = () => {
+    const editor = vscode.window.activeTextEditor;
+    // Keep the current history while a diff, output panel or similar has focus.
+    if (editor?.document.uri.scheme === "file") void follow(editor.document.uri);
+  };
+
+  /** svn: reloads the history if the server has new revisions. Asks at most once per file per interval. */
+  const refreshIfServerMoved = async () => {
+    const t = history.current;
+    if (!t || !(t.source instanceof SvnSource)) return;
+    if ((await t.source.needsReload()) && history.current === t) history.reload();
+  };
+
+  /**
+   * git: reloads the history only if the starting ref or its upstream moved (a commit,
+   * pull, checkout, or a fetch by VS Code's Git extension or a terminal).
+   */
+  const refreshIfMoved = async () => {
+    const t = history.current;
+    if (!t || !(t.source instanceof GitSource)) return;
+    const src = t.source;
+    const key = t.file.toString();
+    const state = await gitState(src.repo, src.ref);
+    if (state !== headByFile.get(key) && history.current === t) {
+      headByFile.set(key, state);
+      history.reload();
+    }
+  };
+
+  const commitArg = (node: Node | undefined): CommitNode | undefined => (node?.type === "commit" ? node : undefined);
+
+  /**
+   * stitch: URI for a side of the current history. SVN keywords are expanded only
+   * when comparing with (or standing in for) the working file; between revisions
+   * they'd mark every $Rev$ line as changed.
+   */
+  const uriFor = (t: Target, side: Side, keywords = false) =>
+    t.source instanceof SvnSource
+      ? sideUri("svn", t.source.root, side, { remote: t.source.info.rootUrl, keywords })
+      : sideUri("git", t.source.root, side);
+
+  const revName = (t: Target, rev: string) => (t.source.vcs === "svn" ? `r${rev}` : rev.slice(0, 7));
+
+  context.subscriptions.push(
+    history,
+    quickDiff,
+    vscode.workspace.registerFileSystemProvider(SCHEME, fsProvider, { isReadonly: true, isCaseSensitive: true }),
+
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      followActive();
+      // Autofetch can move origin/… while the window stays focused: re-check on file switches too.
+      void refreshIfMoved();
+    }),
+    vscode.window.onDidChangeWindowState((s) => {
+      if (!s.focused) return;
+      // The view shows an error or a message (server was unreachable, git timed out, …): try again.
+      if (!history.current) followActive();
+      void refreshIfMoved();
+      void refreshIfServerMoved();
+      void checkSvnMetadata().then((changed) => {
+        void updateSvnModified();
+        if (changed && svnCurrent) followActive(); // an update may have moved BASE
+      });
+    }),
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (svnCurrent && doc.uri.toString() === svnCurrent.file.toString()) void updateSvnModified();
+    }),
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      // Becoming dirty shows Open Changes at once; becoming clean (undo) needs a disk check.
+      if (svnCurrent && e.document.uri.toString() === svnCurrent.file.toString()) {
+        if (e.document.isDirty) setSvnModified(true);
+        else void updateSvnModified();
+      }
+    }),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration("stitch")) return;
+      clearRepos();
+      if (svnCurrent) {
+        history.showMessage("Reloading…");
+        followActive();
+      } else {
+        history.reload();
+      }
+    }),
+
+    vscode.commands.registerCommand("stitch.refresh", () => {
+      resolver.clear();
+      for (const root of svnByRoot.keys()) fsProvider.baseChanged(root);
+      const wasSvn = svnCurrent !== undefined || history.current?.source.vcs === "svn";
+      clearRepos();
+      const t = history.current;
+      if (t && !wasSvn && t.source instanceof GitSource) {
+        const src = t.source;
+        history.reload();
+        void gitState(src.repo, src.ref).then((h) => headByFile.set(t.file.toString(), h));
+      } else {
+        history.showMessage("Reloading…");
+        followActive();
+      }
+    }),
+
+    vscode.commands.registerCommand("stitch.openChanges", async (uri?: vscode.Uri) => {
+      const file = uri instanceof vscode.Uri ? uri : vscode.window.activeTextEditor?.document.uri;
+      if (!file) return;
+      let base;
+      try {
+        base = await svnBaseUri(file);
+      } catch (e) {
+        void vscode.window.showWarningMessage(describeError(e));
+        return;
+      }
+      if (!base) {
+        void vscode.window.showInformationMessage("svn doesn't track this file.");
+        return;
+      }
+      const name = path.basename(file.fsPath);
+      const left = base.node.schedule === "added" ? "(added)" : `BASE r${base.node.revision}`;
+      await vscode.commands.executeCommand("vscode.diff", base.uri, file, `${name} (${left} ↔ Working)`);
+    }),
+
+    vscode.commands.registerCommand("stitch.loadMore", (node: Node) => {
+      if (node?.type === "more") void history.loadMore(node);
+    }),
+
+    vscode.commands.registerCommand("stitch.diffWithPrevious", async (node?: Node) => {
+      const n = commitArg(node);
+      const t = history.current;
+      if (!n || !t) return;
+      const c = n.commit;
+      const { left, right } = previousDiff(c);
+      const leftName = left.kind === "rev" ? (t.source.vcs === "svn" ? `r${left.rev}` : `${c.shortRev}^`) : "(none)";
+      const rightName = right.kind === "rev" ? c.shortRev : "(deleted)";
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        uriFor(t, left),
+        uriFor(t, right),
+        `${path.posix.basename(c.path)} (${leftName} ↔ ${rightName})`,
+        { preview: true }
+      );
+    }),
+
+    vscode.commands.registerCommand("stitch.diffFile", async (node?: Node) => {
+      const t = history.current;
+      if (node?.type !== "file" || !t) return;
+      const { commit: c, file: f } = node;
+      const { left, right } = fileDiff(c, f);
+      const leftName = left.kind === "rev" ? (t.source.vcs === "svn" ? `r${left.rev}` : `${c.shortRev}^`) : "(none)";
+      const rightName = right.kind === "rev" ? c.shortRev : "(deleted)";
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        uriFor(t, left),
+        uriFor(t, right),
+        `${path.posix.basename(f.path)} (${leftName} ↔ ${rightName})`,
+        { preview: true }
+      );
+    }),
+
+    vscode.commands.registerCommand("stitch.diffWithWorking", async (node?: Node) => {
+      const n = commitArg(node);
+      const t = history.current;
+      if (!n || !t) return;
+      const c = n.commit;
+      const side: Side = c.status?.startsWith("D") ? { kind: "empty", path: c.path } : { kind: "rev", rev: c.rev, path: c.path };
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        uriFor(t, side, true),
+        t.file,
+        `${path.basename(t.file.fsPath)} (${revName(t, c.rev)} ↔ working file)`,
+        { preview: true }
+      );
+    }),
+
+    vscode.commands.registerCommand("stitch.openRevision", async (node?: Node) => {
+      const n = commitArg(node);
+      const t = history.current;
+      if (!n || !t) return;
+      const c = n.commit;
+      // For a commit that deleted the file, open the version just before the deletion.
+      const side: Side =
+        c.status?.startsWith("D") && c.parents[0] && c.oldPath
+          ? { kind: "rev", rev: c.parents[0], path: c.oldPath }
+          : { kind: "rev", rev: c.rev, path: c.path };
+      await vscode.commands.executeCommand("vscode.open", uriFor(t, side, true), { preview: true });
+    }),
+
+    vscode.commands.registerCommand("stitch.copyRevision", async (node?: Node) => {
+      const n = commitArg(node);
+      if (n) await vscode.env.clipboard.writeText(n.commit.rev);
+    }),
+
+    vscode.commands.registerCommand("stitch.pickRef", async () => {
+      const t = history.current;
+      if (!t || !(t.source instanceof GitSource)) return;
+      const src = t.source;
+      let refs;
+      try {
+        refs = await src.repo.refs();
+      } catch (e) {
+        void vscode.window.showWarningMessage(describeError(e));
+        return;
+      }
+      const current = refByRoot.get(src.repo.root) ?? "HEAD";
+      const item = (label: string, description?: string): vscode.QuickPickItem => ({
+        label,
+        description: label === current ? "current" : description,
+      });
+      const sep = (label: string): vscode.QuickPickItem => ({ label, kind: vscode.QuickPickItemKind.Separator });
+      const picked = await vscode.window.showQuickPick(
+        [
+          item("HEAD", "checked-out branch"),
+          sep("Branches"),
+          ...refs.branches.map((b) => item(b)),
+          sep("Remote branches"),
+          ...refs.remotes.map((b) => item(b)),
+          sep("Tags"),
+          ...refs.tags.map((b) => item(b)),
+        ],
+        { title: "Show history starting from…", placeHolder: "The trunk is the first-parent line of this ref" }
+      );
+      if (!picked) return;
+      refByRoot.set(src.repo.root, picked.label);
+      history.setTarget(gitTarget(t.file, src.repo, src.relPath, picked.label));
+      headByFile.set(t.file.toString(), await gitState(src.repo, picked.label));
+    })
+  );
+
+  followActive();
+}
+
+export function deactivate(): void {
+  // Nothing to clean up beyond context.subscriptions.
+}
