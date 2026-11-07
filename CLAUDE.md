@@ -14,8 +14,9 @@ A read-only VS Code extension: file history, plus (for SVN) gutter diffs and Ope
 
 ## Rules that must hold
 
-- **Never write.** No command may modify a working copy, a repository, git/svn config, or files on disk. Specifically:
+- **Never write**, with one exception (below). No command may modify a working copy, a repository, git/svn config, or files on disk. Specifically:
   - All git calls go through `src/git/exec.ts` (subcommand allowlist + banned arguments).
+  - **The one exception: the Fetch button** (`stitch.fetch`). It calls `gitFetch()` in `src/git/exec.ts`, a fixed `git fetch --no-prune --no-prune-tags --no-recurse-submodules -- <upstream remote>` with hooks, gc, maintenance and `ext::` turned off. It only runs on a click, in a trusted workspace, and not for repositories on network paths (`src/git/fetchPolicy.ts`). Nothing else may call it, and `fetch` must never join the allowlist; `test/readonly.test.ts` checks both.
   - All SVN HTTP calls go through `request()` in `src/svn/dav.ts` (methods `OPTIONS`/`GET`/`REPORT`, and `log-report` is the only REPORT). Only `dav.ts` may import network modules.
   - `test/readonly.test.ts` must keep passing. Update its command allowlist when a read command is added.
 - **No svn binary.** SVN local data is read from `.svn/` directly; history comes over HTTP.

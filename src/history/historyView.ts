@@ -147,11 +147,26 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
 
   setTarget(target: Target): void {
     this.bump();
+    if (target !== this.target) this.note = undefined;
     this.target = target;
     this.rootNodes = undefined;
     this.view.message = undefined;
-    this.view.description = target.description;
+    this.showDescription();
     this.changed.fire(undefined);
+  }
+
+  /** Short note after the target's description in the view title (e.g. "fetched 3 d ago"). */
+  private note?: string;
+
+  setNote(target: Target, note: string | undefined): void {
+    if (target !== this.target || note === this.note) return;
+    this.note = note;
+    this.showDescription();
+  }
+
+  private showDescription(): void {
+    if (!this.target) return;
+    this.view.description = this.note ? `${this.target.description} · ${this.note}` : this.target.description;
   }
 
   /** Reloads the current target from scratch. */
@@ -398,7 +413,8 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
         : vscode.TreeItemCollapsibleState.None;
     const item = new vscode.TreeItem(label, collapsible);
 
-    const bits = [c.shortRev, c.author, relativeTime(c.date)];
+    // No revision here: it's in the tooltip, and on the row it's clutter.
+    const bits = [c.author, relativeTime(c.date)];
     if (c.isPullMerge) bits.unshift("pull merge");
     else if (expandsToMerged(node)) bits.unshift("merge");
     if (node.incoming) bits.unshift("incoming");

@@ -159,6 +159,25 @@ export class GitRepo {
     return hash ? { name, hash } : undefined;
   }
 
+  /**
+   * The remote `ref`'s upstream lives on ("origin"), for the Fetch button, or
+   * undefined: not a local branch (detached HEAD, tag, hash, remote ref), no
+   * upstream, or an upstream that is another local branch.
+   */
+  async upstreamRemote(ref: string, signal?: AbortSignal): Promise<string | undefined> {
+    const branch = await this.branchName(ref, signal).catch(() => "");
+    if (!branch || branch === "HEAD") return undefined;
+    const out = await this.run(["for-each-ref", "--format=%(upstream:remotename)", `refs/heads/${branch}`], signal);
+    const remote = out.toString("utf8").trim();
+    return remote && remote !== "." ? remote : undefined;
+  }
+
+  /** The repository's (common) .git folder, absolute: where a fetch writes. */
+  async commonDir(signal?: AbortSignal): Promise<string> {
+    const rel = (await this.run(["rev-parse", "--git-common-dir"], signal)).toString("utf8").trim();
+    return path.resolve(this.root, rel);
+  }
+
   /** "main" for HEAD on a branch; the ref itself otherwise. */
   async branchName(ref: string, signal?: AbortSignal): Promise<string> {
     if (ref !== "HEAD") return ref;

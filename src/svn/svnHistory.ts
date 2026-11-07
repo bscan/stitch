@@ -64,6 +64,26 @@ export function mayBeMerge(item: LogItem, p: string): boolean {
 const strip = (p: string) => p.replace(/^\/+/, "");
 
 /**
+ * Where a repository path shows up on disk, for diff tab paths. The working copy
+ * root is checked out from some repository folder (e.g. "trunk/scripts/debug"),
+ * found by taking the local file's path under the root off its repository path.
+ * Paths inside that folder map into the working copy; others (a branch, or a
+ * path outside the checkout) are shown as the repository path ("/branches/x/a.txt").
+ */
+export function svnDisplayPath(root: string, localFile: string, reposPath: string, sidePath: string): string {
+  const rel = path.relative(root, localFile).split(path.sep).join("/");
+  const file = strip(reposPath);
+  const side = strip(sidePath);
+  let base: string | undefined;
+  if (file === rel) base = "";
+  else if (file.endsWith("/" + rel)) base = file.slice(0, -rel.length - 1);
+  if (base === undefined) return "/" + side;
+  if (base === "") return path.join(root, side);
+  if (side.startsWith(base + "/")) return path.join(root, side.slice(base.length + 1));
+  return "/" + side;
+}
+
+/**
  * The files a revision changed (folders left out). A copy whose source the same
  * revision deleted is a move: listed once, as R, without the deletion.
  */

@@ -94,7 +94,7 @@ export class GitSource implements HistorySource {
   /**
    * Commits on the branch's upstream (e.g. origin/main) that changed the file and
    * aren't in the branch: a first-parent walk of the upstream, excluding the branch.
-   * Read-only: uses the remote-tracking branch as of the last fetch; never fetches.
+   * Read-only: uses the remote-tracking branch as of the last fetch (the Fetch button, in extension.ts, is separate).
    */
   private async incoming(limit: number, signal?: AbortSignal): Promise<Incoming | undefined> {
     const up = await this.repo.upstream(this.ref, signal);
@@ -112,7 +112,7 @@ export class GitSource implements HistorySource {
       description: `${up.name}, ${when}`,
       tooltip:
         `The commits above are on ${up.name} but not in ${branch}; a pull brings them in. ` +
-        `${up.name} is as of the last fetch (${fetched ? fetched.toLocaleString() : "never"}); Stitch itself never fetches.`,
+        `${up.name} is as of the last fetch (${fetched ? fetched.toLocaleString() : "never"}); the Fetch button updates it.`,
       rowTooltip: `On ${up.name}, not in ${branch} yet.`,
     };
   }

@@ -2,7 +2,7 @@
   "name": "stitch",
   "displayName": "Stitch",
   "description": "Read-only file history, gutter diffs and Open Changes for SVN and Git files, opened anywhere.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "bscan",
   "license": "MIT",
   "repository": {
@@ -46,6 +46,12 @@
         "title": "Refresh",
         "category": "Stitch",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "stitch.fetch",
+        "title": "Fetch",
+        "category": "Stitch",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "stitch.pickRef",
@@ -92,9 +98,14 @@
           "group": "navigation@1"
         },
         {
+          "command": "stitch.fetch",
+          "when": "view == stitch.history && stitch.kind == git && stitch.canFetch && isWorkspaceTrusted",
+          "group": "navigation@2"
+        },
+        {
           "command": "stitch.refresh",
           "when": "view == stitch.history",
-          "group": "navigation@2"
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -147,6 +158,10 @@
         {
           "command": "stitch.diffFile",
           "when": "false"
+        },
+        {
+          "command": "stitch.fetch",
+          "when": "stitch.canFetch && isWorkspaceTrusted"
         }
       ],
       "editor/title": [
@@ -193,6 +208,31 @@
           "default": 15000,
           "minimum": 1000,
           "description": "Timeout for each git command and each SVN server request, in milliseconds."
+        },
+        "stitch.git.fetchExcludePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "/drives/",
+            "/mnt/",
+            "/smb"
+          ],
+          "scope": "machine",
+          "markdownDescription": "The **Fetch** button isn't offered for repositories under these folders (matched as whole path segments: `/smb` covers `/smb/x`, not `/smbx`). On Linux, repositories on a network file system (`cifs`, `nfs`, `sshfs`, …, from `/proc/mounts`) are excluded too."
+        },
+        "stitch.git.fetchLocalDrives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "C:",
+            "D:"
+          ],
+          "scope": "machine",
+          "markdownDescription": "Windows: the drives that are local disks. The **Fetch** button is only offered for repositories on these drives (never on UNC paths like `\\\\server\\share`)."
         }
       }
     }

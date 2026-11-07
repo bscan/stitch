@@ -29,9 +29,11 @@ export function sideUri(
   vcs: Vcs,
   root: string,
   side: Side,
-  svn?: { remote: string; keywords?: boolean }
+  svn?: { remote: string; keywords?: boolean },
+  /** Path to show for the file; defaults to `side.path` under `root` (right for git and SVN BASE). */
+  displayPath = path.join(root, side.path)
 ): vscode.Uri {
-  const display = vscode.Uri.file(path.join(root, side.path)).path;
+  const display = vscode.Uri.file(displayPath).path;
   const spec: Spec = { vcs, root, side, ...(svn ? { remote: svn.remote, ...(svn.keywords ? { keywords: true } : {}) } : {}) };
   return vscode.Uri.from({ scheme: SCHEME, path: display, query: JSON.stringify(spec) });
 }

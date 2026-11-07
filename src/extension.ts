@@ -2,17 +2,19 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { fileDiff, previousDiff, Side } from "./backend";
 import { Loader, RevisionFileSystem, SCHEME, sideUri } from "./content";
-import { GitOptions } from "./git/exec";
+import { GitError, gitFetch, GitOptions } from "./git/exec";
+import { fetchBlockedReason, readMounts } from "./git/fetchPolicy";
 import { GitRepo } from "./git/gitBackend";
 import { describeError } from "./errors";
 import { CommitNode, HistoryView, Node, Target } from "./history/historyView";
+import { fetchNote, staleFetchMs } from "./history/format";
 import { GitSource } from "./history/source";
 import { SvnQuickDiff } from "./quickDiff";
 import { log, setLogSink } from "./log";
 import { Resolver } from "./resolver";
 import { DavClient, RepoInfo } from "./svn/dav";
 import { SvnRepo } from "./svn/svnBackend";
-import { SvnSource } from "./svn/svnHistory";
+import { SvnSource, svnDisplayPath } from "./svn/svnHistory";
 import { mapRepoUrl } from "./svn/urlMap";
 
 const config = () => vscode.workspace.getConfiguration("stitch");
@@ -98,7 +100,55 @@ export function activate(context: vscode.ExtensionContext): void {
   /** The SVN file the editor shows, if any (for Open Changes and the modified flag). */
   let svnCurrent: { file: vscode.Uri; repo: SvnRepo } | undefined;
 
+  /** Per repo root: why the Fetch button isn't offered there (a network path), or undefined. */
+  const fetchBlockedByRoot = new Map<string, Promise<string | undefined>>();
+  const fetchBlocked = (repo: GitRepo) => {
+    let p = fetchBlockedByRoot.get(repo.root);
+    if (!p) {
+      p = (async () => {
+        const [gitDir, mounts] = await Promise.all([repo.commonDir().catch(() => repo.root), readMounts()]);
+        return fetchBlockedReason([repo.root, gitDir], {
+          excludePaths: config().get<string[]>("git.fetchExcludePaths") ?? [],
+          localDrives: config().get<string[]>("git.fetchLocalDrives") ?? [],
+          platform: process.platform,
+          mounts,
+        });
+      })();
+      fetchBlockedByRoot.set(repo.root, p);
+    }
+    return p;
+  };
+  /** Whether the current file's history view shows the Fetch button. */
+  const setCanFetch = (on: boolean) => void vscode.commands.executeCommand("setContext", "stitch.canFetch", on);
+  const updateCanFetch = async (t: Target) => {
+    const ok = t.source instanceof GitSource && vscode.workspace.isTrusted && !(await fetchBlocked(t.source.repo));
+    if (history.current === t) setCanFetch(ok);
+  };
+  let fetching = false;
+
+  /**
+   * "· fetched 3 d ago" / "· never fetched" in the view title when the branch has an
+   * upstream on a remote and the last fetch (by anything: autofetch, a pull, a terminal,
+   * the Fetch button) isn't recent. Shown on network paths too: it's about how current
+   * the incoming commits are, not about the button.
+   */
+  const updateFetchNote = async (t: Target) => {
+    if (!(t.source instanceof GitSource)) return;
+    const src = t.source;
+    let note: string | undefined;
+    try {
+      if (await src.repo.upstreamRemote(src.ref)) {
+        const git = vscode.workspace.getConfiguration("git", vscode.Uri.file(src.repo.root));
+        note = fetchNote(await src.repo.lastFetch(), staleFetchMs(git.get("autofetch"), git.get("autofetchPeriod")));
+      }
+    } catch {
+      note = undefined;
+    }
+    history.setNote(t, note);
+  };
+
   const clearRepos = () => {
+    fetchBlockedByRoot.clear();
     openByDir.clear();
     reposByRoot.clear();
     svnByDir.clear();
@@ -139,7 +189,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const quickDiff = new SvnQuickDiff(async (file, root) => (await svnBaseUri(file, root).catch(() => undefined))?.uri);
 
   const setSvnModified = (on: boolean) => void vscode.commands.executeCommand("setContext", "stitch.svnModified", on);
-  const setKind = (kind: string | undefined) => void vscode.commands.executeCommand("setContext", "stitch.kind", kind);
+  const setKind = (kind: string | undefined) => {
+    void vscode.commands.executeCommand("setContext", "stitch.kind", kind);
+    if (kind !== "git") setCanFetch(false);
+  };
 
   const updateSvnModified = async () => {
     const cur = svnCurrent;
@@ -234,7 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       if (svnCurrent?.file.toString() !== file.toString()) return; // the user moved on meanwhile
       const source = svnSource(info, repo.root, node.reposPath, node.revision, file);
-      history.setTarget({ file, source, description: `${path.basename(file.fsPath)} @ r${node.revision}` });
+      history.setTarget({ file, source, description: path.basename(file.fsPath) });
     } catch (e) {
       if (svnCurrent?.file.toString() === file.toString()) history.showMessage(describeError(e), file);
     }
@@ -264,7 +317,10 @@ export function activate(context: vscode.ExtensionContext): void {
       const ref = refByRoot.get(repo.root) ?? "HEAD";
       const cur = history.current;
       if (cur?.file.toString() === file.toString() && cur.source instanceof GitSource && cur.source.ref === ref) return;
-      history.setTarget(gitTarget(file, repo, relPath, ref));
+      const target = gitTarget(file, repo, relPath, ref);
+      history.setTarget(target);
+      void updateCanFetch(target);
+      void updateFetchNote(target);
       headByFile.set(file.toString(), await gitState(repo, ref));
     } catch (e) {
       history.showMessage(describeError(e), file);
@@ -296,6 +352,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const refreshIfMoved = async () => {
     const t = history.current;
     if (!t || !(t.source instanceof GitSource)) return;
+    void updateFetchNote(t); // time passes, and something else may have fetched
     const src = t.source;
     const key = t.file.toString();
     const state = await gitState(src.repo, src.ref);
@@ -314,7 +371,13 @@ export function activate(context: vscode.ExtensionContext): void {
    */
   const uriFor = (t: Target, side: Side, keywords = false) =>
     t.source instanceof SvnSource
-      ? sideUri("svn", t.source.root, side, { remote: t.source.info.rootUrl, keywords })
+      ? sideUri(
+          "svn",
+          t.source.root,
+          side,
+          { remote: t.source.info.rootUrl, keywords },
+          svnDisplayPath(t.source.root, t.file.fsPath, t.source.reposPath, side.path)
+        )
       : sideUri("git", t.source.root, side);
 
   const revName = (t: Target, rev: string) => (t.source.vcs === "svn" ? `r${rev}` : rev.slice(0, 7));
@@ -351,6 +414,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("git.autofetch") || e.affectsConfiguration("git.autofetchPeriod")) {
+        if (history.current) void updateFetchNote(history.current);
+      }
       if (!e.affectsConfiguration("stitch")) return;
       clearRepos();
       if (svnCurrent) {
@@ -358,6 +424,64 @@ export function activate(context: vscode.ExtensionContext): void {
         followActive();
       } else {
         history.reload();
+      }
+    }),
+
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      if (history.current) void updateCanFetch(history.current);
+    }),
+
+    // The one command that writes: `git fetch <upstream remote>` (see gitFetch in src/git/exec.ts).
+    vscode.commands.registerCommand("stitch.fetch", async () => {
+      const t = history.current;
+      if (!t || !(t.source instanceof GitSource) || fetching) return;
+      const src = t.source;
+      if (!vscode.workspace.isTrusted) {
+        void vscode.window.showInformationMessage("Stitch fetches only in a trusted workspace.");
+        return;
+      }
+      const why = await fetchBlocked(src.repo);
+      if (why) {
+        void vscode.window.showInformationMessage(`Stitch doesn't fetch here: ${why}.`);
+        return;
+      }
+      const remote = await src.repo.upstreamRemote(src.ref).catch(() => undefined);
+      if (!remote) {
+        const branch = await src.repo.branchName(src.ref).catch(() => src.ref);
+        void vscode.window.showInformationMessage(
+          branch === "HEAD"
+            ? "Nothing to fetch: HEAD is detached, so it has no upstream branch."
+            : `Nothing to fetch: ${branch} has no upstream branch on a remote.`
+        );
+        return;
+      }
+      fetching = true;
+      try {
+        const before = await src.repo.upstream(src.ref).catch(() => undefined);
+        await vscode.window.withProgress(
+          { location: { viewId: "stitch.history" }, title: `Fetching ${remote}…` },
+          () => gitFetch(gitOptions(), src.repo.root, remote)
+        );
+        const after = await src.repo.upstream(src.ref).catch(() => undefined);
+        vscode.window.setStatusBarMessage(
+          after && after.hash !== before?.hash ? `Stitch: fetched ${remote}, ${after.name} moved` : `Stitch: fetched ${remote}, ${after?.name ?? "upstream"} unchanged`,
+          5000
+        );
+        if (history.current === t) {
+          // Reload even if nothing moved: the separator's "fetched …" time changed.
+          headByFile.set(t.file.toString(), await gitState(src.repo, src.ref));
+          history.reload();
+          void updateFetchNote(t);
+        }
+      } catch (e) {
+        const msg =
+          e instanceof GitError && e.kind === "auth"
+            ? `Couldn't fetch ${remote}: it needs credentials, and Stitch can't ask for them. Fetch once from a terminal or set up a credential helper or ssh key.`
+            : `Couldn't fetch ${remote}: ${describeError(e)}`;
+        const choice = await vscode.window.showErrorMessage(msg, "Show Log");
+        if (choice) output.show(true);
+      } finally {
+        fetching = false;
       }
     }),
 
@@ -371,6 +495,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const src = t.source;
         history.reload();
         void gitState(src.repo, src.ref).then((h) => headByFile.set(t.file.toString(), h));
+        void updateFetchNote(t);
       } else {
         history.showMessage("Reloading…");
         followActive();
@@ -497,7 +622,10 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       if (!picked) return;
       refByRoot.set(src.repo.root, picked.label);
-      history.setTarget(gitTarget(t.file, src.repo, src.relPath, picked.label));
+      const target = gitTarget(t.file, src.repo, src.relPath, picked.label);
+      history.setTarget(target);
+      void updateCanFetch(target);
+      void updateFetchNote(target);
       headByFile.set(t.file.toString(), await gitState(src.repo, picked.label));
     })
   );

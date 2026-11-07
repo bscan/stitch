@@ -30,7 +30,7 @@ Each level of the tree is a first-parent walk of the file's history:
 - **Clicking a row** diffs it against its first parent. For a merge, that is the whole branch's change to the file as it landed on the trunk, conflict resolutions included.
 - Renames are followed on the trunk and on branches.
 - The toolbar's branch button picks the starting ref (default: `HEAD`).
-- **Incoming commits** come first when your branch has an upstream (e.g. `origin/main`) with commits you haven't pulled that changed the file. They're tagged "incoming", and a separator row (`──── your branch: main ────`, with "origin/main, fetched 12 min ago" beside it) marks where your branch is. Stitch never fetches: this is as of the last fetch by VS Code's Git extension (`git.autofetch`), a pull, or a terminal. The view reloads when your branch or its upstream moves (checked on window focus and when you switch files).
+- **Incoming commits** come first when your branch has an upstream (e.g. `origin/main`) with commits you haven't pulled that changed the file. They're tagged "incoming", and a separator row (`──── your branch: main ────`, with "origin/main, fetched 12 min ago" beside it) marks where your branch is. This is as of the last fetch: by Stitch's **Fetch** button (cloud icon in the view title), VS Code's Git extension (`git.autofetch`), a pull, or a terminal. When the last fetch isn't recent, the view title says so after the file name (`main.c · fetched 3 d ago`, or `never fetched`). "Recent" is within an hour, or within two autofetch periods if `git.autofetch` is on with a longer `git.autofetchPeriod`, so with autofetch running the note never shows. The view reloads when your branch or its upstream moves (checked on window focus and when you switch files).
 
 Known limitations:
 
@@ -86,6 +86,8 @@ Known limitations:
 
 All are read-only: Open Changes, Refresh, Choose Starting Branch, Load More, Diff with Previous, Diff with Working File, Open This Revision, Copy Revision.
 
+The one exception is **Fetch** (git only, cloud icon in the history view's title). It runs `git fetch <remote>` for the current branch's upstream, which updates `origin/…` and adds objects, but never touches your working tree, index, branches or HEAD. It doesn't prune, recurse into submodules, run hooks, or start gc/maintenance, and it never prompts for credentials. It runs only when you click it, only in trusted workspaces, and isn't offered for repositories on network paths (`stitch.git.fetchExcludePaths`, `stitch.git.fetchLocalDrives`).
+
 ## Settings
 
 | Setting | Default | |
@@ -93,6 +95,8 @@ All are read-only: Open Changes, Refresh, Choose Starting Branch, Load More, Dif
 | `stitch.svn.urlMap` | `{}` | `svn://` → http(s) URL prefixes, for SVN history |
 | `stitch.svn.refreshInterval` | `60` | minimum seconds between automatic SVN server queries for the same file |
 | `stitch.git.path` | `git` | git executable |
+| `stitch.git.fetchExcludePaths` | `["/drives/", "/mnt/", "/smb"]` | no Fetch button for repositories under these folders (whole path segments); on Linux, network mounts (`cifs`, `nfs`, `sshfs`, …) are excluded too |
+| `stitch.git.fetchLocalDrives` | `["C:", "D:"]` | Windows: Fetch is offered only on these drives (never on UNC paths) |
 | `stitch.logLimit` | `50` | entries per page |
 | `stitch.timeoutMs` | `15000` | timeout per git/server request |
 
@@ -101,6 +105,7 @@ All are read-only: Open Changes, Refresh, Choose Starting Branch, Load More, Dif
 Stitch stays enabled in Restricted Mode (folders you haven't trusted), because opening a repository with it can't run code from that repository:
 
 - git runs with repository-configured programs switched off (fsmonitor, textconv, external diff, signature checks), only read subcommands, and no pager.
+- The Fetch button is hidden in Restricted Mode: a fetch uses the repository's configured transport (`core.sshCommand`, `remote.*.uploadpack`, credential helpers), which could run a program.
 - svn needs no program at all; `.svn/` is parsed in-process (sql.js runs SQLite as sandboxed WebAssembly).
 - `stitch.git.path` and `stitch.svn.urlMap` are machine-scoped, so a folder's `.vscode/settings.json` can't change which git runs or where requests go.
 - Commit messages and paths are shown as plain, escaped text; tooltips are never trusted markdown.
@@ -113,8 +118,8 @@ Build a package and install it (on this or another machine):
 
 ```sh
 npm install
-npm run package          # → dist/stitch-0.0.1.vsix
-code --install-extension dist/stitch-0.0.1.vsix
+npm run package          # → dist/stitch-0.0.2.vsix
+code --install-extension dist/stitch-0.0.2.vsix
 ```
 
 Or, in VS Code: Extensions view → `…` → *Install from VSIX…*.
@@ -142,8 +147,9 @@ Press F5 in VS Code to run the extension in a development host.
 
 ### Read-only safeguards
 
-- All git calls go through `src/git/exec.ts`: a subcommand allowlist (`rev-parse`, `rev-list`, `log`, `show`, `cat-file`), banned arguments (`--output`, `--ext-diff`, `--textconv`), and config overrides so repository-configured programs (fsmonitor, textconv, external diff, signature checks) never run.
+- All git calls go through `src/git/exec.ts`: a subcommand allowlist (`rev-parse`, `rev-list`, `log`, `show`, `cat-file`, `for-each-ref`), banned arguments (`--output`, `--ext-diff`, `--textconv`), and config overrides so repository-configured programs (fsmonitor, textconv, external diff, signature checks) never run.
 - All SVN network calls go through `request()` in `src/svn/dav.ts`, which allows only `OPTIONS`, `GET` and `log-report` `REPORT`s and refuses anything else before connecting.
 - `.svn/` is only read. `wc.db` is read into memory and opened by sql.js from that copy, never from the file, and never written back.
 - Revision content is served by a read-only `stitch:` file system from memory; no temp files.
 - Tests check that `.git/` and `.svn/` are byte-for-byte unchanged after use, that no SQLite database is ever exported, that only `dav.ts` imports network modules and refuses write methods without opening a connection, that no source file calls an fs write API or starts processes outside `exec.ts`, and that only the read commands are contributed.
+- The exception: Fetch calls `gitFetch()` in `exec.ts`, a fixed `git fetch` argv outside the allowlist. Tests check it's called only from the `stitch.fetch` command, that the remote can't be an option, and (against a real local remote) that it doesn't prune or run hooks and leaves HEAD, branches, index and working files alone.

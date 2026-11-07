@@ -2,6 +2,7 @@
 import * as assert from "assert";
 import { readdirSync, readFileSync, statSync } from "fs";
 import * as path from "path";
+import { ALLOWED_SUBCOMMANDS, buildFetchArgv, checkArgs } from "../src/git/exec";
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const SRC = path.join(ROOT, "src");
@@ -79,9 +80,11 @@ describe("read-only guarantee", function () {
     // Settings that pick a program to run or where requests go must not be settable by a
     // workspace (a folder's .vscode/settings.json): "machine" scope is user settings only.
     const props = pkg.contributes.configuration.properties;
-    for (const key of ["stitch.git.path", "stitch.svn.urlMap"]) assert.strictEqual(props[key].scope, "machine", key);
+    // The fetch exclusions decide where Stitch may write, so a workspace can't loosen them either.
+    const machine = ["stitch.git.path", "stitch.svn.urlMap", "stitch.git.fetchExcludePaths", "stitch.git.fetchLocalDrives"];
+    for (const key of machine) assert.strictEqual(props[key].scope, "machine", key);
     for (const key of Object.keys(props)) {
-      if (!["stitch.git.path", "stitch.svn.urlMap"].includes(key)) {
+      if (!machine.includes(key)) {
         assert.ok(
           ["stitch.logLimit", "stitch.timeoutMs", "stitch.svn.refreshInterval"].includes(key),
           `review ${key} for untrusted workspaces, then list it here`
@@ -94,7 +97,7 @@ describe("read-only guarantee", function () {
     }
   });
 
-  it("contributes only read commands", function () {
+  it("contributes only read commands, plus Fetch", function () {
     const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
     const commands = (pkg.contributes.commands as { command: string }[]).map((c) => c.command).sort();
     assert.deepStrictEqual(commands, [
@@ -102,11 +105,41 @@ describe("read-only guarantee", function () {
       "stitch.diffFile",
       "stitch.diffWithPrevious",
       "stitch.diffWithWorking",
+      "stitch.fetch", // the one write: see the next test
       "stitch.loadMore",
       "stitch.openChanges",
       "stitch.openRevision",
       "stitch.pickRef",
       "stitch.refresh",
     ]);
+  });
+
+  it("the only git write is the Fetch button's fixed `git fetch <remote>`", function () {
+    // fetch isn't a regular command: git() refuses it.
+    assert.ok(!ALLOWED_SUBCOMMANDS.has("fetch"));
+    assert.throws(() => checkArgs(["fetch", "origin"]), /not allowed/);
+    // gitFetch's argv is fixed; only the remote varies, and it can't be an option.
+    const argv = buildFetchArgv("origin");
+    const sub = argv.indexOf("fetch");
+    assert.deepStrictEqual(argv.slice(sub), ["fetch", "--no-prune", "--no-prune-tags", "--no-recurse-submodules", "--", "origin"]);
+    for (const c of ["core.hooksPath=", "gc.auto=0", "maintenance.auto=false", "protocol.ext.allow=never"]) {
+      assert.ok(argv.some((a) => a.startsWith(c)), c);
+    }
+    for (const bad of ["", ".", "--upload-pack=x", "-u"]) assert.throws(() => buildFetchArgv(bad), /not a remote/);
+    // gitFetch is called from one place: the stitch.fetch command.
+    for (const f of files) {
+      if (f === path.join(SRC, "git", "exec.ts")) continue;
+      const text = readFileSync(f, "utf8");
+      const calls = text.match(/\bgitFetch\s*\(/g) ?? [];
+      if (f === path.join(SRC, "extension.ts")) {
+        assert.strictEqual(calls.length, 1, "extension.ts calls gitFetch once");
+        const cmd = text.indexOf('registerCommand("stitch.fetch"');
+        const next = text.indexOf("registerCommand(", cmd + 1);
+        const at = text.search(/\bgitFetch\s*\(/);
+        assert.ok(cmd !== -1 && at > cmd && (next === -1 || at < next), "gitFetch is called inside the stitch.fetch command");
+      } else {
+        assert.ok(!/\bgitFetch\b/.test(text), `${path.relative(ROOT, f)} uses gitFetch`);
+      }
+    }
   });
 });

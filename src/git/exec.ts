@@ -2,6 +2,10 @@
 // read-only: a subcommand allowlist, banned arguments, and config overrides
 // that stop repository-configured programs (fsmonitor, textconv, external
 // diff, signature verification) from running.
+//
+// The one exception is gitFetch() below: the explicit Fetch button. It runs a
+// fixed `git fetch <remote>`, which only adds objects and moves remote-tracking
+// refs (and FETCH_HEAD), never the working tree, index, local branches or HEAD.
 import { execFile, ExecFileException } from "child_process";
 import { bytes, elapsed, log } from "../log";
 
@@ -11,6 +15,7 @@ export const ALLOWED_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "log",
   "show",
   "cat-file",
+  "for-each-ref",
 ]);
 
 // Arguments that would make an allowed subcommand write a file or run a
@@ -38,6 +43,7 @@ export type GitErrorKind =
   | "dubiousOwnership"
   | "timeout"
   | "cancelled"
+  | "auth"
   | "failed";
 
 export class GitError extends Error {
@@ -132,6 +138,70 @@ export function git(
   });
 }
 
+// Config for the fetch: no hooks (fetch can run reference-transaction), no gc or
+// maintenance afterwards, no commit-graph write, and no ext:: transport even if a
+// repository's config allows it. Passed with -c, so they beat repo and user config.
+const FETCH_CONFIG = [
+  "-c", "core.hooksPath=" + (process.platform === "win32" ? "NUL" : "/dev/null"),
+  "-c", "gc.auto=0",
+  "-c", "maintenance.auto=false",
+  "-c", "fetch.writeCommitGraph=false",
+  "-c", "protocol.ext.allow=never",
+];
+// No pruning (it deletes remote-tracking refs and tags), no submodules.
+const FETCH_ARGS = ["fetch", "--no-prune", "--no-prune-tags", "--no-recurse-submodules"];
+/** Fetches can be slow; never cut one off sooner than this. */
+const FETCH_MIN_TIMEOUT_MS = 120_000;
+
+/** The full argv for fetching `remote`. Throws GitError("notAllowed") for a remote name that isn't one. */
+export function buildFetchArgv(remote: string): string[] {
+  if (!remote || remote === "." || remote.startsWith("-") || /[\0\n]/.test(remote)) {
+    throw new GitError(`not a remote name: ${JSON.stringify(remote)}`, "notAllowed");
+  }
+  return [...GLOBAL_ARGS, ...FETCH_CONFIG, ...FETCH_ARGS, "--", remote];
+}
+
+/**
+ * The only git command Stitch runs that writes: `git fetch <remote>`, run only
+ * when the user clicks Fetch. Credentials prompts are off (GIT_TERMINAL_PROMPT=0),
+ * so a remote that needs a login fails with kind "auth" instead of waiting.
+ */
+export function gitFetch(opts: GitOptions, cwd: string, remote: string, signal?: AbortSignal): Promise<void> {
+  let argv: string[];
+  try {
+    argv = buildFetchArgv(remote);
+  } catch (e) {
+    return Promise.reject(e);
+  }
+  const shown = `git fetch ${remote}`;
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    execFile(
+      opts.gitPath,
+      argv,
+      {
+        cwd,
+        env: { ...process.env, ...GIT_ENV },
+        encoding: "buffer",
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: Math.max(opts.timeoutMs, FETCH_MIN_TIMEOUT_MS),
+        windowsHide: true,
+        signal,
+      },
+      (err, _stdout, stderr) => {
+        if (!err) {
+          log.info(`${shown} → done in ${elapsed(start)} (${cwd})`);
+          resolve();
+          return;
+        }
+        const e = classify(err, stderr.toString("utf8"));
+        log.warn(`${shown} → ${e.kind}: ${e.message} after ${elapsed(start)} (${cwd})\n${stderr.toString("utf8").trim()}`);
+        reject(e);
+      }
+    );
+  });
+}
+
 function classify(err: ExecFileException, stderr: string): GitError {
   if (err.code === "ENOENT") {
     return new GitError("git executable not found", "notFound", stderr);
@@ -145,6 +215,13 @@ function classify(err: ExecFileException, stderr: string): GitError {
   if (/dubious ownership/i.test(stderr)) {
     const m = /safe\.directory\s+'?([^'\n]+?)'?\s*$/m.exec(stderr);
     return new GitError("repository is owned by another user", "dubiousOwnership", stderr, m?.[1]);
+  }
+  if (
+    /could not read (username|password)|authentication failed|permission denied \(|host key verification failed|terminal prompts disabled/i.test(
+      stderr
+    )
+  ) {
+    return new GitError("the remote needs credentials", "auth", stderr);
   }
   if (/not a git repository/i.test(stderr)) {
     return new GitError("not a git repository", "notARepo", stderr);
