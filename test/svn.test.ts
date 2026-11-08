@@ -5,12 +5,15 @@ process.env.TZ = "UTC"; // the fixture client ran in UTC; $Date$ uses local time
 import * as assert from "assert";
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
+import { closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { DatabaseSync } from "node:sqlite";
 import * as os from "os";
 import * as path from "path";
 import { contractKeywords, expandKeywords, parseKeywords } from "../src/svn/keywords";
 import { parseProps } from "../src/svn/skel";
-import { encodeReposPath, nodeUrl, SvnRepo } from "../src/svn/svnBackend";
+import { isNotFound } from "../src/errors";
+import { encodeReposPath, nodeUrl, SvnError, SvnRepo } from "../src/svn/svnBackend";
+import { closeWcDb } from "../src/svn/wcdb";
 
 const FIXTURES = path.resolve(__dirname, "..", "..", "test", "fixtures");
 
@@ -186,3 +189,139 @@ describe("svn keywords", function () {
     assert.strictEqual(encodeReposPath("a b/c#d/e@f+g"), "a%20b/c%23d/e@f+g");
   });
 });
+
+describe("damaged and busy svn 1.7+ working copies", function () {
+  let tmp: string;
+  let wc: string;
+  let db: string;
+
+  beforeEach(function () {
+    tmp = mkdtempSync(path.join(os.tmpdir(), "stitch-broken-"));
+    execFileSync("tar", ["xzf", path.join(FIXTURES, "svn114.tar.gz"), "-C", tmp]);
+    wc = path.join(tmp, "wc");
+    db = path.join(wc, ".svn", "wc.db");
+  });
+
+  afterEach(function () {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const damaged = (re: RegExp) => (e: unknown) => e instanceof SvnError && e.kind === "damaged" && re.test(e.message);
+  const a = () => path.join(wc, "a.txt");
+  /** Writes to the fixture's wc.db the way svn would (tests only). */
+  const write = (sql: string) => {
+    const w = new DatabaseSync(db);
+    w.exec(sql);
+    w.close();
+  };
+
+  it("reads while svn holds a write lock (immutable: no locks, no journal)", async function () {
+    const repo = await SvnRepo.open(wc);
+    const w = new DatabaseSync(db);
+    try {
+      w.exec("BEGIN EXCLUSIVE; UPDATE NODES SET changed_author = 'someone-else'");
+      const node = await repo.node(a());
+      assert.ok(node);
+      assert.notStrictEqual(node.changedAuthor, "someone-else"); // the committed state
+    } finally {
+      w.exec("ROLLBACK");
+      w.close();
+    }
+  });
+
+  it("notices when svn changed wc.db and reads the new state", async function () {
+    const repo = await SvnRepo.open(wc);
+    const before = (await repo.node(a()))!;
+    assert.strictEqual(await repo.changed(), false);
+    write(`UPDATE NODES SET changed_author = 'after-update' WHERE local_relpath = 'a.txt'`);
+    assert.strictEqual(await repo.changed(), true);
+    const after = (await repo.node(a()))!;
+    assert.notStrictEqual(before.changedAuthor, "after-update");
+    assert.strictEqual(after.changedAuthor, "after-update");
+    assert.strictEqual(await repo.changed(), false);
+  });
+
+  it("keeps reading after an interrupted svn command (work queue not empty)", async function () {
+    write(`INSERT INTO WORK_QUEUE (work) VALUES (x'00')`);
+    assert.ok(await (await SvnRepo.open(wc)).node(a()));
+  });
+
+  it("says so when wc.db is truncated, garbage or empty", async function () {
+    const bytes = readFileSync(db);
+    writeFileSync(db, bytes.subarray(0, Math.floor(bytes.length / 3)));
+    await assert.rejects((await SvnRepo.open(wc)).node(a()), damaged(/damaged|cleanup/));
+    writeFileSync(db, Buffer.alloc(bytes.length, 0x5a));
+    await assert.rejects((await SvnRepo.open(wc)).node(a()), damaged(/damaged/));
+    writeFileSync(db, Buffer.alloc(0));
+    await assert.rejects((await SvnRepo.open(wc)).node(a()), damaged(/empty or damaged/));
+  });
+
+  it("says so when wc.db disappears after the working copy was opened", async function () {
+    const repo = await SvnRepo.open(wc);
+    rmSync(db);
+    await assert.rejects(repo.node(a()), damaged(/missing/));
+  });
+
+  it("says so when a file's repository row is gone", async function () {
+    write("PRAGMA foreign_keys = OFF; DELETE FROM REPOSITORY");
+    await assert.rejects((await SvnRepo.open(wc)).node(a()), damaged(/no repository/));
+  });
+
+  it("says so when a BASE text is missing from .svn/pristine", async function () {
+    const repo = await SvnRepo.open(wc);
+    const node = (await repo.node(a()))!;
+    rmSync(path.join(wc, ".svn", "pristine", node.sha1!.slice(0, 2), `${node.sha1}.svn-base`));
+    await assert.rejects(repo.original(node), damaged(/pristine/));
+    assert.ok(!isNotFound(new SvnError("x", "damaged")), "shown as an error, not as 'file not found'");
+  });
+
+  const timedOut = (re: RegExp) => (e: unknown) => e instanceof SvnError && e.kind === "unavailable" && re.test(e.message);
+  /** Retries `f` until it resolves (a stuck reader's thread exits asynchronously). */
+  const eventually = async <T>(f: () => Promise<T>, ms = 5000): Promise<T> => {
+    const end = Date.now() + ms;
+    for (;;) {
+      try {
+        return await f();
+      } catch (e) {
+        if (Date.now() > end) throw e;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    }
+  };
+
+  it("gives up on a reader that doesn't answer in time, and recovers", async function () {
+    await closeWcDb(); // the next read starts a new worker, which can't answer within 0 ms
+    await assert.rejects((await SvnRepo.open(wc, () => 0)).node(a()), timedOut(/took longer/));
+    assert.ok(await eventually(async () => (await SvnRepo.open(wc)).node(a())));
+  });
+
+  it("doesn't pile up threads on a read that stays stuck, and reads again once it returns", async function () {
+    if (process.platform === "win32") this.skip();
+    // Opening a FIFO blocks in open() until a writer comes, like a read on a hung
+    // share: terminate() can't interrupt it, so the thread stays stuck.
+    const other = path.join(tmp, "other");
+    execFileSync("tar", ["xzf", path.join(FIXTURES, "svn114.tar.gz"), "-C", tmp, "--transform", "s,^wc,other,"]);
+    const saved = path.join(tmp, "wc.db.saved");
+    copyFileSync(db, saved);
+    rmSync(db);
+    execFileSync("mkfifo", [db]);
+    const repo = await SvnRepo.open(wc, () => 300);
+
+    await assert.rejects(repo.node(a()), timedOut(/took longer than 300 ms/));
+    // The same file again: refused at once, without starting another thread.
+    const start = Date.now();
+    await assert.rejects(repo.node(a()), timedOut(/still stuck/));
+    assert.ok(Date.now() - start < 200, "refused without waiting for the timeout");
+    // Other working copies still get a reader.
+    assert.ok(await (await SvnRepo.open(other)).node(path.join(other, "a.txt")));
+
+    // The "share" comes back: the blocked open() returns, the stuck thread exits,
+    // and the file is read normally again.
+    closeSync(openSync(db, "w"));
+    rmSync(db);
+    copyFileSync(saved, db);
+    assert.ok(await eventually(() => repo.node(a())));
+  });
+});
+
+after(() => closeWcDb());

@@ -1,6 +1,73 @@
 # Context: how Stitch came about, and what was decided
 
-This is a compacted record of the design conversation behind Stitch, kept for whoever picks the work up next. `docs/PLAN.md` is the plan itself. This file records **why** things are the way they are, the facts that were checked, and the questions still open.
+This is the maintainer's record for Stitch, kept for whoever picks the work up next. It records **how** Stitch is built, **why** things are the way they are, the facts that were checked, and the questions still open. The [README](../README.md) describes the features from the user's side.
+
+## How it's built
+
+```
+active editor (file: URI)
+  └─ resolver.ts: walk up from the file's folder; the nearest .git or .svn wins (handles nesting; a .git
+       │           without HEAD, or a .git file without `gitdir:`, is ignored); results cached per folder
+       ├─ git/exec.ts        the only place that runs a process: subcommand allowlist + gitFetch()
+       ├─ git/gitBackend.ts  GitRepo: log, show, upstream, fetch-age;  git/parse.ts: -z log output
+       ├─ git/fetchPolicy.ts whether the Fetch button is offered (network paths, drives)
+       └─ svn/svnBackend.ts  SvnRepo: BASE text with keywords expanded, modification check
+            ├─ wc16.ts       entries formats 8–10 (svn 1.4–1.6): .svn/entries, text-base/, prop-base/
+            ├─ wc17.ts       wc.db formats 29–31 (svn 1.7–1.14), via wcdb.ts → wcdbWorker.ts (node:sqlite thread)
+            ├─ skel.ts       wc.db property lists;  keywords.ts: svn:keywords expansion/contraction
+            ├─ dav.ts        HTTPv2 client; the only module allowed to import network modules
+            ├─ xml.ts        small XML parser for server responses;  urlMap.ts: svn:// → http(s)
+            └─ svnHistory.ts SvnSource
+history/source.ts    HistorySource (top, more, expand, count; opaque per-level context), GitSource
+history/historyView.ts  the tree view;  history/format.ts: labels, fetch note;  history/patch.ts: Copy Diff
+content.ts           read-only `stitch:` FileSystemProvider (raw bytes, so VS Code decodes both diff sides alike)
+quickDiff.ts         one empty SourceControl per SVN working copy, for the gutter
+log.ts, errors.ts    logging sink (→ "Stitch" output channel), describeError/isCancelled/isNotFound
+```
+
+Only `extension.ts`, `content.ts`, `quickDiff.ts` and `history/historyView.ts` import `vscode`; the rest is tested with plain mocha.
+
+### Git queries
+- **Top level:** `git log --first-parent --follow -n <limit> --name-status --format=<NUL-delimited> -- <path>`. With `--first-parent`, merges are compared only with their first parent, so exactly the trunk commits and merges that changed the file on trunk are listed. Paging continues from `<last>^1` with the last row's old path (not `--skip`), which keeps rename tracking right across pages.
+- **Expand merge M:** `git log --first-parent --follow M^2 ^M^1 [^outer first parents…] -- <pathAtM>` (exclusions built by `GitRepo.childExclude`), so merges inside a branch expand like trunk merges. "(N commits)" is `rev-list --count` over the same range, only for merges on screen, at most 4 at once.
+- **Changed files:** one `git log --no-walk=unsorted -m --first-parent -M --name-status` per page. The view waits for it before showing the page (`HistoryView.settle()`): VS Code lays out a level by which rows have expand arrows, and arrows that appear later shift rows sideways.
+- **Diffs** are first-parent: `stitch:git/<rev>^1/<oldPath>` ↔ `stitch:git/<rev>/<path>`. Added/deleted files and root commits compare with empty content. No `--diff-merges` (git ≥ 2.31 only).
+- **Incoming:** `rev-parse --abbrev-ref --symbolic-full-name <ref>@{upstream}`, then `log --first-parent --follow <upstream> ^<ref> -- <path>`. Fetch age is the mtime of `rev-parse --git-path FETCH_HEAD`. The reload check is "<ref hash> <upstream hash>", on window focus and editor switches.
+- **Copy Diff** computes the unified diff itself (Myers, 3 lines of context) from the two sides served by `stitch:`: SVN has no binary to ask, and `git diff` would need another allowlisted subcommand. Non-UTF-8 is read as Latin-1; content with a NUL byte is reported as binary.
+- Tree items have stable ids (the chain of revisions from the top). Without them VS Code keys rows by label, and updating a merge row's label failed with "Data tree node not found".
+
+### SVN over HTTP (`dav.ts`, servers 1.7+)
+| Operation | Request |
+|---|---|
+| Discover | `OPTIONS <url>`: headers `SVN-Repository-Root`, `SVN-Youngest-Rev`, `SVN-Rev-Root-Stub`, `SVN-Repository-UUID`. No `SVN-Rev-Root-Stub` means pre-1.7 ("server too old"). |
+| History | `REPORT <root>/!svn/rvr/<peg>/<path>` with `<S:log-report>` (changed paths, author/date/log revprops). The peg must be the file's own path at that revision: mod_dav_svn doesn't trace a peg back to an older path, so paging and merge expansion peg at `<rev>/<path at rev>`. |
+| Merges | Candidates are revisions that changed the file with `prop-mods` on it or a parent folder. For those on screen, `log-report` with `include-merged-revisions` for that single revision gives the merged revisions (cached for the session, at most 4 at once). |
+| Incoming | `log-report` pegged at youngest, `start = youngest`, `end = BASE + 1`; a 404 means the path is gone at HEAD. |
+| Content | `GET <root>/!svn/rvr/<rev>/<path>`; `?kw=1` for keyword-expanded (1.8+) in Diff with Working File and Open This Revision, raw for Diff with Previous. |
+
+There is no `get-locations`: the file's path at each revision is derived from the log's changed paths (`copyfrom-*` on the file or a copied parent folder). `stitch:` URIs for svn revisions carry the repository's http(s) root, so restored diff tabs work after a reload. Requests go through VS Code's patched Node networking, so proxy settings and system CAs apply.
+
+**Server load:** no timers or polling. `SvnSource.top()` returns its last result (or last failure) within `stitch.svn.refreshInterval`; sources are kept per file|repo|path|BASE (LRU of 30). `DavClient.options()` caches failures for the interval. `needsReload()` (on focus) asks at most once per interval. Refresh and settings changes drop all of it. Tests count real requests through the log sink.
+
+### SVN working copies
+- **wc17:** the working node is the `NODES` row with the highest `op_depth`; its checksum is what svn compares against (for a copy, the copy source). History info comes from `op_depth = 0`, or the copy source.
+- **wc16:** the working-copy root is the highest ancestor whose entries list the folder below as a child directory, so a 1.6 working copy gets one `SourceControl`, and externals stay separate.
+- **Modification check** mirrors `svn status`: size + mtime first, then a byte compare after contracting keywords and, with `svn:eol-style`, normalizing line endings. The `stitch.svnModified` context key is also true when the editor is dirty.
+- **BASE invalidation:** when `wc.db`/`entries` change (checked on focus and Refresh), `stitch:` fires change events for the BASE URIs it served, so gutters and open diffs re-read.
+
+### Read-only enforcement
+| Layer | Enforcement |
+|---|---|
+| Commands | `test/readonly.test.ts` checks that `package.json` contributes exactly the allowlisted commands. |
+| SCM provider | The quick-diff `SourceControl` has no visible input box, no accept command, no resource groups, no status-bar commands. |
+| Git | `src/git/exec.ts`: subcommands `rev-parse`, `rev-list`, `log`, `show`, `cat-file`, `for-each-ref`; banned `--output`, `--textconv`, `--ext-diff`, `--show-signature`; `-c core.fsmonitor=false -c diff.external= -c log.showSignature=false`; env `GIT_OPTIONAL_LOCKS=0 GIT_LITERAL_PATHSPECS=1 GIT_TERMINAL_PROMPT=0 LC_ALL=C`. Only `exec.ts` imports `child_process`. |
+| Fetch (the one write) | `gitFetch()`: fixed argv, see CLAUDE.md and the decision below. `test/fetch.test.ts` runs it against a real local remote. |
+| SVN over HTTP | `request()` allows `OPTIONS`, `GET`, and `REPORT` with a `log-report` body only; everything else throws before any I/O. |
+| Working copy on disk | `.svn/` is read with `readFile`/`stat`. `wc.db` is opened `readOnly`, `?mode=ro&immutable=1`, `trusted_schema` off, and only `SELECT`/`PRAGMA user_version` run (`isReadQuery()`). A test bans fs write APIs across `src/`, and the fixture tests hash `.svn/` and `.git/` before and after. |
+| `stitch:` provider | Registered `isReadonly`; write/delete/rename/createDirectory throw `NoPermissions`. |
+| Messages | Suggestions (`safe.directory`, `svn cleanup`) are shown as text only, never run. |
+
+Out of scope: the built-in Git extension still offers commit for git files; that's VS Code's, not Stitch's.
 
 ## Origin
 
@@ -32,7 +99,7 @@ The first ideas were to patch svn-scm: a history-only `RemoteRepository` fallbac
 | The view is titled **Stitch History** (was "File History") | User choice, so it's obvious the view comes from this extension and isn't confused with the built-in Timeline or other extensions' "File History". The view header already shows the current file's name. |
 | **SVN needs no binary at all** | The user asked "why do we need an svn binary at all?". Local data (URL, revision, BASE content) is read from `.svn/`. History comes over plain HTTP, which is possible because the servers are **1.7+ (HTTPv2), http(s), anonymous read**. That removes the 1.6-vs-1.14 client mismatch entirely, and nothing ever touches the working copy. |
 | `svn://` working copies get a URL-mapping setting, checked against the repo UUID | Some working copies were checked out via `svn://`. The servers also serve http(s). |
-| Read-only is **enforced at each layer**, not just left out | User requirement. See the "Read-only guarantee" table in PLAN.md. |
+| Read-only is **enforced at each layer**, not just left out | User requirement. See "Read-only enforcement" above. |
 | Git history is a **trunk view with expandable merges** | The user asked how merges are shown, then asked for an evaluation of a concept someone else suggested (below). |
 | Clicking a merge diffs it against the **first parent only**; there are no extra merge diff actions | User choice. The options offered and declined were PR-style (merge-base ↔ M^2), vs branch tip (M^2 ↔ M), and `--remerge-diff`. Per-commit detail comes from expanding the merge. |
 | **Enabled in untrusted workspaces** (`capabilities.untrustedWorkspaces.supported: true`) | User request. Safe because nothing in a repository can make Stitch run code: git's repo-configured programs are disabled in `src/git/exec.ts`, svn needs no program, and the two settings that pick a program or a server are `machine`-scoped (a workspace can't set them). `test/readonly.test.ts` pins all of this. Accepted residual: a crafted SVN working copy decides which URL gets read-only anonymous OPTIONS/GET/REPORT requests. Virtual workspaces are declared unsupported (Stitch needs real files). |
@@ -42,6 +109,7 @@ The first ideas were to patch svn-scm: a history-only `RemoteRepository` fallbac
 | **Stale fetches are flagged subtly in the view title** ("main.c · fetched 3 d ago"), not with a separator row or popup | User choice: only when the last fetch is more than max(1 h, 2 × autofetch period) old, so it never shows while autofetch runs. Detection uses `FETCH_HEAD`'s age rather than the `git.autofetch` setting (which can be on for repos VS Code's Git doesn't have open, or failing); the setting only stretches the threshold. Considered and dropped: always showing the "your branch" separator with click-to-fetch, and the remote URL in a tooltip (URLs can carry credentials, and reading one safely needs another fixed helper). |
 | **A commit expands to its changed files only when it changed other files too** | User request: expanding to just the current file is useless. Merges keep expanding to merged commits, with the files grouped above them. |
 | **At most one automatic SVN query per file per interval** (`stitch.svn.refreshInterval`, default 60 s) | User concern from svn-scm, which could get stuck hammering the server (a retry/checkFrequency setting). Stitch never polled, but switching between files and refocusing re-queried, and merge checks (`log -g`) re-ran per visit. Now histories are reused per file within the interval, failures aren't retried until it passes, and merge checks run once per file per session. Refresh always queries. |
+| **wc.db is read with `node:sqlite`, read-only and immutable, in a worker thread; minimum VS Code 1.101** (2026-11) | User decision. sql.js copied the whole wc.db into memory and re-read it after every svn command; on large checkouts on network drives that meant reading tens to hundreds of MB over the corporate network. Real SQLite reads only the pages a lookup touches. The user chose to drop VS Code < 1.101 (over a year old) and sql.js instead of keeping both. `immutable=1` (no locks, no journal) was chosen over plain read-only because SQLite locking over SMB/NFS is slow and unreliable and a reader can't recover a hot journal anyway; the cost is that SQLite assumes the file doesn't change, so the worker reopens the connection when wc.db's stamp (mtime ns, size, inode) changes and retries a read that overlapped a write (3 tries, 200 ms apart). Accepted residual: a read during an svn write whose changes were partly flushed before Stitch looked can see that partial state until svn finishes (the next read after the stamp changes is correct). The worker exists because `node:sqlite` is synchronous: a hung share would freeze the extension host; the main side times out (`stitch.timeoutMs`) and replaces the worker. `terminate()` can't interrupt a thread blocked in a file system call, so an abandoned worker is tracked with the wc.db it was reading until it actually exits: reads of that same file fail at once (no new thread per editor switch), other wc.dbs get a fresh worker, and at most 4 stuck workers are allowed overall. When the share recovers the call returns, the thread exits and the file reads normally; no timer is involved. Checked with a FIFO as wc.db (`open()` blocks until a writer comes; `test/svn.test.ts`). Damaged working copies (truncated/garbage/empty wc.db, missing repository rows or pristine files) give an SvnError of kind `damaged` that suggests svn cleanup; an interrupted svn command (non-empty WORK_QUEUE) is logged and reading continues. These problems show in the Stitch History view, never as a popup from just opening a file (user request); a damaged BASE found by the gutter's background read shows above that file's history (`HistoryView.setWarning`). Popups only come from commands the user ran. Checked: Electron 35.0.2+ ships `node:sqlite` unflagged; on Node 22.15.1 an immutable read succeeds while another connection holds an exclusive lock, and the fixture tests pass. Windows drive and UNC URIs (`file:///C:/…`, `file:////server/share/…`) follow SQLite's URI rules but are untested. |
 | `stitch.svn.urlMap` is `{ "<svn:// prefix>": "<http(s) prefix>" }` | Confirmed by the user, with a real example: `svn list svn://svn/project/` and `svn list http://svn/repos/project/` list the same repository, i.e. `{ "svn://svn": "http://svn/repos" }`. |
 | SVN merges **expand to the merged revisions** (like `svn log -g`), matching the git view | The user left it to us ("up to you"). Done lazily per merge-candidate row, so the top-level log stays a cheap plain `svn log`. |
 | `stitch:` is a read-only FileSystemProvider that returns raw **bytes** | Old SVN repos contain non-UTF-8 files. Returning bytes lets VS Code decode both sides of the diff the same way. svn-scm bundles jschardet/iconv for this reason. |
@@ -57,7 +125,7 @@ It was rejected because:
 - **Topo order doesn't guarantee grouping.** Children are only promised to come before parents.
 - **Sync merges become noise**, renames were missing, and the two query windows don't line up when paged.
 
-The adopted alternative is a first-parent walk at every level, with lazy per-merge expansion (see PLAN.md).
+The adopted alternative is a first-parent walk at every level, with lazy per-merge expansion (see "Git queries" above).
 
 ### Facts checked during the conversation
 - Git 2.54, `--first-parent --follow --name-status`: a merge reports its rename against the first parent (`R087 g.txt h.txt`), and the range `M^2 ^M^1` works together with `--follow`.
@@ -75,17 +143,14 @@ The adopted alternative is a first-parent walk at every level, with lazy per-mer
 
 ## Environment
 
-- Dev machine: Linux, Node 22, git 2.54, VS Code 1.143, **podman** available, **no svn installed**. Images that work: `docker.io/debian/eol:squeeze` (svn 1.6.12, apt from archive.debian.org with `Acquire::Check-Valid-Until=false`), `docker.io/debian/eol:jessie` (1.8.10), `docker.io/library/alpine:3.20` (1.14.5, `apk add subversion`). Milestone 4 still needs an Apache mod_dav_svn 1.14 server with anonymous read.
-- VS Code engine target: `^1.85.0`. Tool versions are pinned in `package.json`.
+- Dev machine: Linux, Node 22, git 2.54, VS Code 1.143, **podman** available, **no svn installed**. Images that work: `docker.io/debian/eol:squeeze` (svn 1.6.12, apt from archive.debian.org with `Acquire::Check-Valid-Until=false`), `docker.io/debian/eol:jessie` (1.8.10), `docker.io/library/alpine:3.20` (1.14.5, `apk add subversion`). The test server is Apache + mod_dav_svn 1.14 in `test/fixtures/svn-server/` (Containerfile, `build-repo.sh` with the repository history and the real client's expected output, an Apache config that denies everything but GET/PROPFIND/OPTIONS/REPORT), started by `test/svnServer.ts`.
+- VS Code engine target: `^1.101.0` (Electron 35, Node 22.15: the first with `node:sqlite` enabled; see the decision below). Tool versions are pinned in `package.json`.
 
-## State at handoff
+## Current state
 
-- Milestones 1–5 are implemented, plus incoming changes (svn and git) and changed files (128 tests). `npm test` takes about 4 s (the SVN server tests start a podman container and skip without podman). `npm run build` bundles to `dist/extension.js` and copies `sql-wasm.wasm` next to it. Runtime dependency: `sql.js` 1.12.0 (MIT).
-- Milestone 1 has been run in an Extension Development Host (and the author bubbles and view name since); the SVN features (milestones 2–4) and milestone 5 have not.
-- **Not yet done:**
-  - Run the SVN features in an Extension Development Host (F5) against the real servers, including an `svn://` working copy with `stitch.svn.urlMap` set.
-  - Install the `.vsix` (`npm run package`) on the machine with the real SVN working copies and servers; the "Stitch" output channel shows each request if something fails.
-  - Make a first git commit. The repo was initialized with all files untracked, and the user commits only when they ask.
+- Released features: Git and SVN history with expandable merges and changed files, incoming changes (svn and git), the Fetch button and fetch-age note (git), SVN gutter and Open Changes, Copy Diff. See `CHANGELOG.md`.
+- `npm test` runs in a few seconds (the SVN server tests start a podman container and are skipped without podman). No runtime dependencies: wc.db is read with Node's built-in `node:sqlite`.
+- Git history has been run in an Extension Development Host. **Not yet checked by hand:** the SVN features against the real servers, including an `svn://` working copy with `stitch.svn.urlMap` set, and the `.vsix` installed on the machine with the real working copies (the "Stitch" output channel shows each request if something fails).
 
 ## Open questions
 

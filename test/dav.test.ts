@@ -209,10 +209,20 @@ describe("svn history over HTTP (mod_dav_svn in podman)", function () {
     return n;
   }
 
+  it("reuses a fresh OPTIONS answer for the youngest revision", async function () {
+    const fresh = new DavClient(() => 10000);
+    const repo = await fresh.options(`${server!.base}/svn/repo`);
+    // Just opened: log + incoming only, no second OPTIONS.
+    const source = new SvnSource(fresh, repo, "/wc", "trunk/b.txt", 20);
+    assert.strictEqual(await requestsDuring(() => source.top(50)), 2);
+    // Reload checks always ask.
+    assert.strictEqual(await requestsDuring(() => fresh.youngest(repo)), 1);
+  });
+
   it("asks the server about a file at most once per interval", async function () {
     const source = new SvnSource(client, info, "/wc", "trunk/b.txt", 20, () => 60_000);
     let first: unknown;
-    assert.ok((await requestsDuring(async () => (first = await source.top(50)))) >= 3); // youngest + log + incoming
+    assert.ok((await requestsDuring(async () => (first = await source.top(50)))) >= 2); // log + incoming (+ youngest if stale)
     let again: unknown;
     assert.strictEqual(await requestsDuring(async () => (again = await source.top(50))), 0);
     assert.strictEqual(again, first);

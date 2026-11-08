@@ -40,7 +40,7 @@ interface MoreNode {
 interface InfoNode {
   type: "info";
   text: string;
-  parent?: CommitNode;
+  parent?: CommitNode | FilesNode;
   command?: vscode.Command;
   icon?: string;
   description?: string;
@@ -145,12 +145,26 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     this.changed.fire(undefined);
   }
 
+  /** Per file: a problem shown above its history (e.g. its BASE text is missing). */
+  private readonly warnings = new Map<string, string>();
+
+  /**
+   * Shows `text` above the file's history while it's the current file, or clears it.
+   * For problems found in the background (the gutter's BASE read), which must not pop up.
+   */
+  setWarning(file: vscode.Uri, text: string | undefined): void {
+    const key = file.toString();
+    if (text === undefined ? !this.warnings.delete(key) : this.warnings.get(key) === text) return;
+    if (text !== undefined) this.warnings.set(key, text);
+    if (this.target?.file.toString() === key && this.rootNodes?.length !== 0) this.view.message = text;
+  }
+
   setTarget(target: Target): void {
     this.bump();
     if (target !== this.target) this.note = undefined;
     this.target = target;
     this.rootNodes = undefined;
-    this.view.message = undefined;
+    this.view.message = this.warnings.get(target.file.toString());
     this.showDescription();
     this.changed.fire(undefined);
   }
@@ -274,7 +288,19 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     const files = [...(commit.files ?? [])].sort(
       (a, b) => Number(b.path === commit.path) - Number(a.path === commit.path) || a.path.localeCompare(b.path)
     );
-    return files.map((file) => ({ type: "file", file, commit, parent }));
+    const nodes: Node[] = files.map((file) => ({ type: "file", file, commit, parent }));
+    const hidden = (commit.filesTotal ?? 0) - files.length;
+    if (hidden > 0) {
+      nodes.push({
+        type: "info",
+        key: "more-files",
+        text: `… ${hidden} more file${hidden === 1 ? "" : "s"} not listed`,
+        icon: "ellipsis",
+        tooltip: `This revision changed ${commit.filesTotal} files; only the first ${files.length} are listed.`,
+        parent,
+      });
+    }
+    return nodes;
   }
 
   /**
@@ -388,7 +414,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
       return item;
     }
     if (node.type === "files") {
-      const n = node.parent.commit.files?.length ?? 0;
+      const n = node.parent.commit.filesTotal ?? node.parent.commit.files?.length ?? 0;
       const item = new vscode.TreeItem(`Changed files (${n})`, vscode.TreeItemCollapsibleState.Collapsed);
       item.iconPath = new vscode.ThemeIcon("files");
       return item;

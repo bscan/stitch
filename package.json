@@ -2,7 +2,7 @@
   "name": "stitch",
   "displayName": "Stitch",
   "description": "Read-only file history, gutter diffs and Open Changes for SVN and Git files, opened anywhere.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "bscan",
   "license": "MIT",
   "repository": {
@@ -10,7 +10,7 @@
     "url": "https://github.com/bscan/stitch-vscode.git"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.101.0"
   },
   "categories": [
     "SCM Providers"
@@ -88,6 +88,11 @@
         "command": "stitch.copyRevision",
         "title": "Copy Revision",
         "category": "Stitch"
+      },
+      {
+        "command": "stitch.copyDiff",
+        "title": "Copy Diff",
+        "category": "Stitch"
       }
     ],
     "menus": {
@@ -128,6 +133,11 @@
           "command": "stitch.copyRevision",
           "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge)/",
           "group": "3_copy@1"
+        },
+        {
+          "command": "stitch.copyDiff",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge|file)$/",
+          "group": "3_copy@2"
         }
       ],
       "commandPalette": [
@@ -157,6 +167,10 @@
         },
         {
           "command": "stitch.diffFile",
+          "when": "false"
+        },
+        {
+          "command": "stitch.copyDiff",
           "when": "false"
         },
         {
@@ -199,7 +213,7 @@
         },
         "stitch.logLimit": {
           "type": "number",
-          "default": 50,
+          "default": 40,
           "minimum": 1,
           "description": "Number of history entries loaded per page."
         },
@@ -238,9 +252,8 @@
     }
   },
   "scripts": {
-    "build": "npm run copy-wasm && esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --sourcemap --outfile=dist/extension.js",
-    "watch": "npm run copy-wasm && esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --sourcemap --outfile=dist/extension.js --watch",
-    "copy-wasm": "node -e \"require('fs').mkdirSync('dist',{recursive:true});require('fs').copyFileSync(require.resolve('sql.js/dist/sql-wasm.wasm'),'dist/sql-wasm.wasm')\"",
+    "build": "esbuild src/extension.ts src/svn/wcdbWorker.ts --bundle --platform=node --target=node22 --format=cjs --external:vscode --sourcemap --outdir=dist --entry-names=[name]",
+    "watch": "esbuild src/extension.ts src/svn/wcdbWorker.ts --bundle --platform=node --target=node22 --format=cjs --external:vscode --sourcemap --outdir=dist --entry-names=[name] --watch",
     "typecheck": "tsc -p . --noEmit",
     "test": "tsc -p tsconfig.test.json && mocha --timeout 60000 'out/test/**/*.test.js'",
     "vscode:prepublish": "npm run build -- --minify",
@@ -248,15 +261,11 @@
   },
   "devDependencies": {
     "@types/mocha": "10.0.10",
-    "@types/node": "20.17.10",
-    "@types/sql.js": "1.4.9",
-    "@types/vscode": "1.85.0",
+    "@types/node": "22.15.34",
+    "@types/vscode": "1.101.0",
     "@vscode/vsce": "3.2.1",
     "esbuild": "0.24.2",
     "mocha": "10.8.2",
     "typescript": "5.7.2"
-  },
-  "dependencies": {
-    "sql.js": "1.12.0"
   }
 }

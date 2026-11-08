@@ -28,6 +28,8 @@ export interface Commit {
    * svn fills it from the log; git fills it later, a page at a time.
    */
   files?: ChangedFile[];
+  /** Set when `files` lists only some of them (svn keeps at most 100): how many the commit changed. */
+  filesTotal?: number;
 }
 
 /** One file changed by a commit. Paths are repository-relative, without a leading slash. */

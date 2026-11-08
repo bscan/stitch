@@ -3,6 +3,7 @@ import * as assert from "assert";
 import { readdirSync, readFileSync, statSync } from "fs";
 import * as path from "path";
 import { ALLOWED_SUBCOMMANDS, buildFetchArgv, checkArgs } from "../src/git/exec";
+import { isReadQuery, wcdbUri } from "../src/svn/wcdbProtocol";
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const SRC = path.join(ROOT, "src");
@@ -56,10 +57,26 @@ describe("read-only guarantee", function () {
     }
   });
 
-  it("never serializes an SQLite database (wc.db is only read into memory)", function () {
+  it("opens SQLite only in the wc.db worker, read-only and immutable, and runs only reads", function () {
+    const worker = path.join(SRC, "svn", "wcdbWorker.ts");
     for (const f of files) {
+      if (f === worker) continue;
       const text = readFileSync(f, "utf8");
-      assert.ok(!/\.export\s*\(/.test(text), `${path.relative(ROOT, f)} calls .export()`);
+      assert.ok(!/["']node:sqlite["']|["']sql\.js["']|better-sqlite3|["']sqlite3["']/.test(text), `${path.relative(ROOT, f)} uses SQLite`);
+    }
+    const text = readFileSync(worker, "utf8");
+    const opens = text.match(/new DatabaseSync\(.*\);/g) ?? [];
+    assert.deepStrictEqual(opens, ["new DatabaseSync(wcdbUri(file), { readOnly: true });"]);
+    assert.ok(!/\.exec\s*\(/.test(text), "the worker runs statements only through prepare() after isReadQuery()");
+    assert.ok(/if \(!isReadQuery\(q\.sql\)\) throw/.test(text));
+    // The URI: read-only mode, immutable (no locks, no journal), special characters escaped.
+    assert.strictEqual(wcdbUri("/wc/.svn/wc.db"), "file:///wc/.svn/wc.db?mode=ro&immutable=1");
+    assert.strictEqual(wcdbUri("/a b/x?#%/.svn/wc.db"), "file:///a b/x%3F%23%25/.svn/wc.db?mode=ro&immutable=1");
+    assert.strictEqual(wcdbUri("C:\\wc\\.svn\\wc.db"), "file:///C:/wc/.svn/wc.db?mode=ro&immutable=1");
+    assert.strictEqual(wcdbUri("\\\\server\\share\\wc\\.svn\\wc.db"), "file:////server/share/wc/.svn/wc.db?mode=ro&immutable=1");
+    for (const ok of ["PRAGMA user_version", "SELECT 1", "  select x from t where a = ?"]) assert.ok(isReadQuery(ok), ok);
+    for (const bad of ["PRAGMA journal_mode=WAL", "DELETE FROM t", "SELECT 1; DELETE FROM t", "ATTACH 'x' AS y", "VACUUM"]) {
+      assert.ok(!isReadQuery(bad), bad);
     }
   });
 
@@ -101,6 +118,7 @@ describe("read-only guarantee", function () {
     const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
     const commands = (pkg.contributes.commands as { command: string }[]).map((c) => c.command).sort();
     assert.deepStrictEqual(commands, [
+      "stitch.copyDiff",
       "stitch.copyRevision",
       "stitch.diffFile",
       "stitch.diffWithPrevious",

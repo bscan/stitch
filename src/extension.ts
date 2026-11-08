@@ -8,12 +8,14 @@ import { GitRepo } from "./git/gitBackend";
 import { describeError } from "./errors";
 import { CommitNode, HistoryView, Node, Target } from "./history/historyView";
 import { fetchNote, staleFetchMs } from "./history/format";
+import { decodeText, formatDiff, SideText } from "./history/patch";
 import { GitSource } from "./history/source";
 import { SvnQuickDiff } from "./quickDiff";
 import { log, setLogSink } from "./log";
 import { Resolver } from "./resolver";
 import { DavClient, RepoInfo } from "./svn/dav";
-import { SvnRepo } from "./svn/svnBackend";
+import { SvnError, SvnRepo } from "./svn/svnBackend";
+import { closeWcDb } from "./svn/wcdb";
 import { SvnSource, svnDisplayPath } from "./svn/svnHistory";
 import { mapRepoUrl } from "./svn/urlMap";
 
@@ -72,7 +74,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const svnRepo = (dir: string) => {
     let p = svnByDir.get(dir);
     if (!p) {
-      p = SvnRepo.open(dir).then((repo) => {
+      p = SvnRepo.open(dir, timeoutMs).then((repo) => {
         const shared = svnByRoot.get(repo.root) ?? repo;
         svnByRoot.set(repo.root, shared);
         return shared;
@@ -157,7 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
     dav = new DavClient(timeoutMs, svnIntervalMs);
   };
 
-  const history = new HistoryView(() => config().get<number>("logLimit") ?? 50);
+  const history = new HistoryView(() => config().get<number>("logLimit") ?? 40);
 
   const load: Loader = async ({ vcs, root, side, remote, keywords }) => {
     if (vcs === "svn") {
@@ -165,7 +167,17 @@ export function activate(context: vscode.ExtensionContext): void {
         const repo = await svnRepo(root);
         const node = await repo.wc.node(side.path);
         if (!node) throw new Error(`${side.path} is not versioned`);
-        return repo.original(node);
+        // The gutter reads BASE silently, so a damaged .svn would just mean "no markers".
+        // Say why in the history view instead (no popup: this runs whenever a file opens).
+        const file = vscode.Uri.file(path.join(repo.root, side.path));
+        try {
+          const data = await repo.original(node);
+          history.setWarning(file, undefined);
+          return data;
+        } catch (e) {
+          if (e instanceof SvnError && e.kind === "damaged") history.setWarning(file, describeError(e));
+          throw e;
+        }
       }
       if (side.kind !== "rev" || !remote) throw new Error("bad svn side");
       return dav.get(await dav.options(remote), Number(side.rev), side.path, { keywords });
@@ -243,8 +255,12 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     svnCurrent = { file, repo };
     void updateSvnModified();
-    if (node.schedule === "added" || !node.reposRoot || node.reposPath === undefined || node.revision === undefined) {
+    if (node.schedule === "added") {
       history.showMessage("This file is scheduled for addition, so it has no history yet.", file);
+      return;
+    }
+    if (!node.reposRoot || node.reposPath === undefined || node.revision === undefined) {
+      history.showMessage("svn's metadata for this file has no repository URL or revision; the working copy may be damaged (svn cleanup can help).", file);
       return;
     }
     // History starts at the file's BASE revision, like `svn log` on a working-copy file.
@@ -591,6 +607,29 @@ export function activate(context: vscode.ExtensionContext): void {
       if (n) await vscode.env.clipboard.writeText(n.commit.rev);
     }),
 
+    // Message, author, date and a unified diff of this one file (not the commit's other files).
+    vscode.commands.registerCommand("stitch.copyDiff", async (node?: Node) => {
+      const t = history.current;
+      if (!t || (node?.type !== "commit" && node?.type !== "file")) return;
+      const c = node.commit;
+      const { left, right } = node.type === "file" ? fileDiff(c, node.file) : previousDiff(c);
+      // Through the stitch: file system, so content already shown in a diff comes from its cache.
+      const read = async (side: Side): Promise<SideText> =>
+        side.kind === "empty"
+          ? { side, text: "" }
+          : { side, text: decodeText(await vscode.workspace.fs.readFile(uriFor(t, side))) };
+      try {
+        const text = await vscode.window.withProgress(
+          { location: { viewId: "stitch.history" }, title: "Copying diff…" },
+          async () => formatDiff({ vcs: t.source.vcs, commit: c, left: await read(left), right: await read(right) })
+        );
+        await vscode.env.clipboard.writeText(text);
+        vscode.window.setStatusBarMessage(`Stitch: copied the diff of ${path.posix.basename(right.path)} at ${revName(t, c.rev)}`, 4000);
+      } catch (e) {
+        void vscode.window.showWarningMessage(`Couldn't copy the diff: ${describeError(e)}`);
+      }
+    }),
+
     vscode.commands.registerCommand("stitch.pickRef", async () => {
       const t = history.current;
       if (!t || !(t.source instanceof GitSource)) return;
@@ -633,6 +672,6 @@ export function activate(context: vscode.ExtensionContext): void {
   followActive();
 }
 
-export function deactivate(): void {
-  // Nothing to clean up beyond context.subscriptions.
+export function deactivate(): Promise<void> {
+  return closeWcDb(); // the wc.db reader thread
 }

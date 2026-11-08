@@ -23,6 +23,9 @@ interface Located {
   renamed: boolean;
 }
 
+/** How old a youngest-revision answer may be for the incoming list (ms). */
+export const RECENT_YOUNGEST_MS = 10_000;
+
 const isUnder = (p: string, dir: string) => dir === "/" || p.startsWith(dir + "/");
 
 /** How `item` changed the file at `p`, and where it came from. */
@@ -83,16 +86,18 @@ export function svnDisplayPath(root: string, localFile: string, reposPath: strin
   return "/" + side;
 }
 
+/** At most this many of a revision's changed files are kept per row (a big merge or import lists thousands). */
+export const MAX_FILES = 100;
+
 /**
- * The files a revision changed (folders left out). A copy whose source the same
- * revision deleted is a move: listed once, as R, without the deletion.
+ * The files a revision changed (folders left out), sorted by path, and how many
+ * there are. A copy whose source the same revision deleted is a move: listed once,
+ * as R, without the deletion. Beyond `max`, only the first files are kept, and
+ * `keep` (the history's own file, a repository path) always is.
  */
-export function changedFiles(item: LogItem): ChangedFile[] {
-  const moved = new Set(
-    item.paths
-      .filter((c) => c.copyFromPath && item.paths.some((d) => d.action === "D" && d.path === c.copyFromPath))
-      .map((c) => c.copyFromPath!)
-  );
+export function changedFiles(item: LogItem, keep?: string, max = Infinity): { files: ChangedFile[]; total: number } {
+  const deleted = new Set(item.paths.filter((d) => d.action === "D").map((d) => d.path));
+  const moved = new Set(item.paths.filter((c) => c.copyFromPath && deleted.has(c.copyFromPath)).map((c) => c.copyFromPath!));
   const files: ChangedFile[] = [];
   for (const c of item.paths) {
     if (c.kind === "dir") continue;
@@ -111,7 +116,16 @@ export function changedFiles(item: LogItem): ChangedFile[] {
       files.push({ path: strip(c.path), status, fromRev: String(item.rev - 1) });
     }
   }
-  return files.sort((a, b) => a.path.localeCompare(b.path));
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  const total = files.length;
+  if (total <= max) return { files, total };
+  const own = keep === undefined ? undefined : strip(keep);
+  const kept = files.slice(0, max);
+  const mine = files.find((f) => f.path === own);
+  if (mine && !kept.includes(mine)) {
+    kept[kept.length - 1] = mine; // still sorted: it comes after every other kept file
+  }
+  return { files: kept, total };
 }
 
 export function toCommit(item: LogItem, p: string): { commit: Commit; before?: At } {
@@ -125,6 +139,7 @@ export function toCommit(item: LogItem, p: string): { commit: Commit; before?: A
   else if (added) status = "A";
   else if (loc.src && loc.src.path !== p) status = loc.renamed ? "R" : "C";
   else status = "M";
+  const { files, total } = changedFiles(item, p, MAX_FILES);
   const commit: Commit = {
     rev: String(item.rev),
     shortRev: `r${item.rev}`,
@@ -140,7 +155,8 @@ export function toCommit(item: LogItem, p: string): { commit: Commit; before?: A
     path: strip(p),
     oldPath: before && before.rev > 0 ? strip(before.path) : undefined,
     status,
-    files: changedFiles(item),
+    files,
+    ...(total > files.length ? { filesTotal: total } : {}),
   };
   return { commit, before: before && before.rev > 0 ? before : undefined };
 }
@@ -221,7 +237,8 @@ export class SvnSource implements HistorySource {
    * of the same path, from its youngest revision down to BASE + 1.
    */
   private async incoming(limit: number, signal?: AbortSignal): Promise<Incoming | undefined> {
-    const youngest = await this.client.youngest(this.info, signal);
+    // Right after the OPTIONS that opened the repository (or a reload check), its answer is current enough.
+    const youngest = await this.client.youngest(this.info, signal, RECENT_YOUNGEST_MS);
     this.youngestSeen = youngest;
     if (youngest <= this.peg) return undefined;
     const base = {

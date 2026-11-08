@@ -40,5 +40,10 @@ export function isCancelled(e: unknown): boolean {
 
 /** The content doesn't exist (as opposed to: couldn't be fetched). */
 export function isNotFound(e: unknown): boolean {
-  return (e instanceof DavError && e.kind === "notFound") || (e instanceof GitError && e.kind === "failed") || e instanceof SvnError;
+  return (
+    (e instanceof DavError && e.kind === "notFound") ||
+    (e instanceof GitError && e.kind === "failed") ||
+    // A damaged or unreadable working copy isn't "not found": its message says what's wrong.
+    (e instanceof SvnError && e.kind !== "damaged" && e.kind !== "unavailable")
+  );
 }

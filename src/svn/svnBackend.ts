@@ -30,13 +30,13 @@ async function exists(p: string): Promise<boolean> {
 }
 
 /** Opens the working copy whose .svn marker sits in `dir` (from the resolver). */
-export async function openWorkingCopy(dir: string): Promise<SvnWorkingCopy> {
-  if (await exists(path.join(dir, ".svn", "wc.db"))) return new Wc17(dir);
+export async function openWorkingCopy(dir: string, timeoutMs?: () => number): Promise<SvnWorkingCopy> {
+  if (await exists(path.join(dir, ".svn", "wc.db"))) return new Wc17(dir, timeoutMs);
   const format = await readEntriesFormat(dir);
   if (format !== undefined && ENTRIES_FORMATS.includes(format)) return new Wc16(await Wc16.findRoot(dir));
   throw new SvnError(
     format === undefined
-      ? "This .svn folder has no wc.db or entries file."
+      ? "This .svn folder has no wc.db or entries file, so it looks incomplete. A fresh checkout fixes it."
       : format < 8
         ? `This working copy (format ${format}) is from svn 1.3 or older, which isn't supported.`
         : `Unknown SVN working copy format ${format}.`,
@@ -85,8 +85,9 @@ export class SvnRepo {
     return this.wc.root;
   }
 
-  static async open(dir: string): Promise<SvnRepo> {
-    return new SvnRepo(await openWorkingCopy(dir));
+  /** `timeoutMs`: how long a wc.db read may take (a slow network drive). */
+  static async open(dir: string, timeoutMs?: () => number): Promise<SvnRepo> {
+    return new SvnRepo(await openWorkingCopy(dir, timeoutMs));
   }
 
   relPath(file: string): string {

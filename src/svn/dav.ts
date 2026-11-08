@@ -280,6 +280,8 @@ export function logReportBody(o: LogOptions): string {
 
 export class DavClient {
   private readonly infos = new Map<string, { p: Promise<RepoInfo>; failedAt?: number }>();
+  /** Per repository root: the youngest revision in the last OPTIONS answer, and when it came. */
+  private readonly seen = new Map<string, { rev: number; at: number }>();
 
   constructor(
     private readonly timeoutMs: () => number,
@@ -321,16 +323,23 @@ export class DavClient {
       throw new DavError("This SVN server is older than 1.7 (no HTTPv2), which Stitch doesn't support.", "tooOld");
     }
     const origin = new URL(res.url).origin;
-    return {
+    const info = {
       rootUrl: (origin + root).replace(/\/+$/, ""),
       uuid,
       youngest: parseInt(h("svn-youngest-rev") ?? "0", 10),
       revRootStub: origin + stub,
     };
+    this.seen.set(info.rootUrl, { rev: info.youngest, at: Date.now() });
+    return info;
   }
 
-  /** The server's youngest revision right now (never cached). */
-  async youngest(info: RepoInfo, signal?: AbortSignal): Promise<number> {
+  /**
+   * The server's youngest revision. Reuses the last OPTIONS answer for this repository
+   * if it is at most `maxAgeMs` old (default 0: always asks).
+   */
+  async youngest(info: RepoInfo, signal?: AbortSignal, maxAgeMs = 0): Promise<number> {
+    const last = this.seen.get(info.rootUrl);
+    if (last && maxAgeMs > 0 && Date.now() - last.at <= maxAgeMs) return last.rev;
     return (await this.fetchOptions(info.rootUrl, signal)).youngest;
   }
 

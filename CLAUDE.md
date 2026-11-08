@@ -2,14 +2,14 @@
 
 A read-only VS Code extension: file history, plus (for SVN) gutter diffs and Open Changes, for any file opened anywhere. It supports SVN (1.6 and 1.8–1.14 working copies, no svn binary) and Git (history only).
 
-**Read first:** `docs/PLAN.md` (the approved plan and implementation status) and `docs/CONTEXT.md` (why decisions were made, facts that were checked, open questions).
+**Read first:** `docs/CONTEXT.md` (how Stitch is built, why decisions were made, facts that were checked, open questions) and `README.md` (the features as users see them). Record user-visible changes in `CHANGELOG.md`.
 
 ## Commands
 
 - `npm test`: compiles `test/` (with the `src/` files it imports) to `out/` and runs mocha. The git tests build a real fixture repo in a temp folder. The SVN tests unpack `test/fixtures/svn*.tar.gz` (working copies made by real 1.6/1.8/1.14 clients) and compare against those clients' own `svn info`/`svn cat`/`svn status` output.
 - The SVN history tests (`test/dav.test.ts`) build and start `test/fixtures/svn-server` (Apache + mod_dav_svn 1.14) with podman; set `STITCH_NO_PODMAN=1` to skip them.
 - `test/fixtures/make-svn-fixtures.sh [svn16|svn18|svn114]`: rebuilds those tarballs with podman (there is no svn on the dev machine). Commit the regenerated tarballs.
-- `npm run build`: esbuild bundle to `dist/extension.js` (plus `dist/sql-wasm.wasm`). `npm run package`: `.vsix` in `dist/`. `npm run typecheck`: `tsc --noEmit`.
+- `npm run build`: esbuild bundles to `dist/extension.js` and `dist/wcdbWorker.js` (the wc.db reader thread). `npm run package`: `.vsix` in `dist/`. `npm run typecheck`: `tsc --noEmit`.
 - F5 runs the extension in a development host (`.vscode/launch.json`).
 
 ## Rules that must hold

@@ -1,155 +1,166 @@
 # Stitch
 
-Read-only file history for SVN and Git, for any file you open — with or without a folder, on a local disk or a network drive.
+**Read-only file history for SVN and Git, for any file you open.** It works with or without a workspace folder, on a local disk or a network drive. SVN needs no `svn` binary.
 
-- **Stitch History** view in the Explorer sidebar, for the active editor's file.
-  Each row has a bubble with the author's initial; the color is fixed per author (by name), in git and SVN alike. Merges are tagged "merge" and expand.
-- **Changed files:** a commit that changed other files besides this one expands to all of them (this file marked); click one to diff it. Under a merge they're grouped as "Changed files (N)" above the merged commits. Commits that changed only this file don't expand.
-- Git history is shown as a **trunk with expandable merges** (below).
-- **SVN gutter diffs** and an **Open Changes** button (working file ↔ BASE) for SVN 1.4–1.6 and 1.7–1.14 working copies, read straight from `.svn/`, with no svn binary.
-- **SVN history** read over http(s) straight from the server (1.7+, anonymous read), with merge revisions expandable to the revisions they merged. `svn://` working copies work through a URL mapping.
+- **Stitch History** in the Explorer sidebar: the history of the file in the active editor, with merges you can expand.
+- **SVN gutter diffs and Open Changes**: compare the editor with BASE, read straight from `.svn/`, so it works offline.
+- **Incoming changes**: commits on the server (SVN) or upstream branch (Git) that you don't have yet, shown above a "your working copy" / "your branch" line.
+- **Never writes.** There are no commit, update, revert or cleanup commands. Stitch never changes a working copy, a repository, or git/svn configuration, and it never upgrades old SVN working copies. The one exception is the optional Git **Fetch** button ([below](#fetch-git)).
 
-Stitch never writes: it has no commit, update, revert or similar commands, never changes a working copy or repository, and never changes git or svn configuration.
+## Requirements
 
-## Status
+- VS Code 1.101 or newer.
+- **Git:** a `git` executable (the one VS Code's Git uses is fine).
+- **SVN:** working copies made by svn 1.4–1.14. Nothing needs to be installed. History needs an http(s) server running svn 1.7 or newer that allows anonymous read. `svn://` working copies work through a [URL mapping](#svn-and-svnssh-working-copies).
 
-| Milestone | State |
-|---|---|
-| 1. Git history (trunk view, merges, renames, paging, diffs) | done |
-| 2. SVN 1.7+ local reads, gutter, Open Changes | done |
-| 3. SVN 1.6 local reads, keyword expansion | done |
-| 4. SVN history over HTTP, `svn://` URL mapping | done |
-| 5. Hardening (cancellation, logging, retries, packaging) | done |
+## Stitch History
 
-## Git: trunk view
+Open any file under Git or SVN and the **Stitch History** view in the Explorer shows its history, following renames and copies.
 
-Each level of the tree is a first-parent walk of the file's history:
+- Each row shows the subject, author, date and branch/tag labels. Each author gets an initial in a colored bubble, and the color stays the same for that name in Git and SVN alike. The tooltip has the full message.
+- **Click a row** to diff the file against the previous revision.
+- **Merges** are tagged "merge" with a count ("(3 commits)"), and expand to the commits they brought in that changed the file. Merges nested inside a branch expand the same way.
+- **Changed files:** a commit that also changed other files expands to all of them, with this file marked. Click one to diff it. Under a merge they're grouped as "Changed files (N)" above the merged commits.
+- **Load More** at the bottom loads the next page (`stitch.logLimit` entries).
+- **Right-click a row** for:
+  - **Diff with Previous**
+  - **Diff with Working File**
+  - **Open This Revision**
+  - **Copy Revision**
+  - **Copy Diff**: the commit's revision, author, date and message, then a unified diff of just this file. Git output looks like `git log -p` and SVN output like `svn log` + `svn diff`. Also available on files listed under a commit.
 
-- **Top level** — the commits and merges that changed the file on the branch you're on (`git log --first-parent --follow`). A merge whose branch didn't touch the file is not shown.
-- **Expanding a merge** shows the commits it brought in that changed the file (`M^2`, excluding everything already on the trunk). Merges inside a branch expand the same way.
-- **Clicking a row** diffs it against its first parent. For a merge, that is the whole branch's change to the file as it landed on the trunk, conflict resolutions included.
-- Renames are followed on the trunk and on branches.
-- The toolbar's branch button picks the starting ref (default: `HEAD`).
-- **Incoming commits** come first when your branch has an upstream (e.g. `origin/main`) with commits you haven't pulled that changed the file. They're tagged "incoming", and a separator row (`──── your branch: main ────`, with "origin/main, fetched 12 min ago" beside it) marks where your branch is. This is as of the last fetch: by Stitch's **Fetch** button (cloud icon in the view title), VS Code's Git extension (`git.autofetch`), a pull, or a terminal. When the last fetch isn't recent, the view title says so after the file name (`main.c · fetched 3 d ago`, or `never fetched`). "Recent" is within an hour, or within two autofetch periods if `git.autofetch` is on with a longer `git.autofetchPeriod`, so with autofetch running the note never shows. The view reloads when your branch or its upstream moves (checked on window focus and when you switch files).
+### Git: the trunk view
 
-Known limitations:
+Git history is shown as a trunk with merges you can expand, rather than one long list of every commit:
 
-- **Pull merges** (`Merge branch 'main' of …`, from `git pull` without rebase) have their parents swapped: the first parent is the local work. They're labelled *pull merge*; the remote's trunk appears under them.
-- Squash- or rebase-only repositories have no merges, so the view is a flat list.
-- For git files, the gutter and *Open Changes* come from VS Code's built-in Git extension.
+- **Top level:** the commits and merges that changed the file on your branch (its first-parent history). A merge whose branch didn't touch the file isn't shown.
+- **Expanding a merge** shows the commits it brought in that changed the file.
+- **Clicking a merge** diffs it against its first parent: the whole branch's change to the file as it landed, conflict resolutions included.
+- **Choose Starting Branch** (branch icon in the view title) shows history from another ref, such as `origin/main`. The default is `HEAD`.
 
-## SVN: gutter and Open Changes
+### Incoming changes
 
-For a file in an SVN working copy, Stitch compares the editor with BASE (the pristine copy svn keeps in `.svn/`), so it works offline and on network drives:
+**SVN:** revisions on the server, newer than your working copy, that changed the file come first, tagged "incoming". A separator (`──── your working copy: r1234 ────`) marks where your working copy is. If the file was moved or deleted on the server since, the separator says so.
 
-- **Gutter markers** like the built-in Git ones. Stitch registers an empty "SVN (Stitch)" provider per working copy in the Source Control view; it has no commit box and no actions.
-- **Open Changes** (editor title bar, shown when the file differs from BASE) opens BASE ↔ working file.
-- `svn:keywords` (`$Id$`, `$Rev$`, `$Date$`, …, including fixed-width and custom keywords) are expanded in BASE the way the svn client expands them, so keyword lines don't show up as changes.
-- Added files compare against an empty file; copied files compare against their copy source.
+**Git:** when your branch has an upstream (such as `origin/main`) with commits you haven't pulled that changed the file, they come first, tagged "incoming". The separator reads `──── your branch: main ────`, with "origin/main, fetched 12 min ago" beside it. This reflects the last fetch, whether it came from Stitch's Fetch button, VS Code's autofetch, a pull or a terminal. When the last fetch is more than an hour old (or more than two autofetch periods, if those are longer), the view title says so: `main.c · fetched 3 d ago`.
 
-Supported working copies: svn 1.4–1.6 (`.svn/entries` formats 8–10) and 1.7–1.14 (`.svn/wc.db`). Stitch never upgrades or otherwise touches them, so 1.6 clients can keep using theirs.
+The view reloads when the server, your branch or its upstream moves. Stitch checks when the window regains focus and when you switch files.
 
-Known limitations:
+### Fetch (Git)
 
-- `$Date$` is expanded in your local time zone. If the client that last updated the file ran in a different zone, that line shows as changed.
-- Property-only changes don't count as modifications.
-- svn 1.15 working copies without pristine copies (`store-pristine = no`) and svn ≤ 1.3 working copies are not supported.
+The cloud icon in the view title runs `git fetch` for your branch's upstream remote, so the incoming commits are up to date. This is Stitch's only write, and it is limited:
 
-## SVN: history
+- It only updates remote-tracking branches (`origin/…`) and adds objects. It never touches your working tree, index, local branches or HEAD.
+- It doesn't prune, recurse into submodules, run hooks or start gc/maintenance, and it never prompts for credentials.
+- It runs only when you click it, never on a timer.
+- It's offered only in trusted workspaces, and not for repositories on network paths (see `stitch.git.fetchExcludePaths` and `stitch.git.fetchLocalDrives`).
 
-The Stitch History view shows `svn log` for the file, following copies and renames:
+## SVN gutter diffs and Open Changes
 
-- **Incoming** revisions come first: revisions on the server newer than your working copy's BASE that changed the file, tagged "incoming". A separator row (`──── your working copy: r1234 ────`) marks where your working copy is; everything below it is history you have. If the file was moved or deleted on the server since, the separator says so. Stitch checks the server again when the window regains focus (at most every 30 s) and on Refresh.
-- Below the separator: the file's history from BASE down, like `svn log` on a working-copy file.
-- **Server load:** Stitch has no timers and never polls. It asks the server about a file when you open it, and then at most once per `stitch.svn.refreshInterval` (default 60 s) however often you switch files or refocus the window; within that time the loaded history is reused. A server that failed isn't asked again until the interval passes. Merge checks (`svn log -g`, the expensive query) run once per file per session. **Refresh** always asks.
+For a file in an SVN working copy, Stitch compares the editor with BASE (the copy of the file as you last updated it, which svn keeps in `.svn/`). No server is needed.
 
-History It's read over http(s) with the server's WebDAV protocol, so no svn binary is needed; servers must be svn 1.7 or newer and allow anonymous read.
+- **Gutter markers**, like the built-in Git ones.
+- **Open Changes** (in the editor title bar when the file differs from BASE) opens a BASE ↔ working file diff.
+- **Keywords** set in `svn:keywords` (`$Id$`, `$Rev$`, `$Date$` and the rest, including fixed-width and custom keywords) are expanded in BASE the way the svn client does it, so keyword lines don't show up as changes.
+- Added files compare against an empty file, and copied files against their copy source.
+- Non-UTF-8 files (common in old repositories) are decoded the same way on both sides, so they don't show as completely changed.
 
-- **Clicking a row** diffs the file against its previous revision (across a rename or copy, against the source).
-- **Merges:** a revision that changed the file and set properties on it or a parent folder (where `svn:mergeinfo` lives) is checked with `svn log -g` for that one revision. If it merged revisions that changed the file, it's shown with a merge icon and "(N revisions)", and expands to them, like `svn log -g`. Nested merges expand too.
-- **Diff with Working File** and **Open This Revision** show keywords expanded (the server does it, svn 1.8+), so they line up with the working file.
-- **`svn://` and `svn+ssh://` working copies** need a mapping to the server's http(s) URL, in `stitch.svn.urlMap`:
+Stitch adds an empty "SVN (Stitch)" entry per working copy to the Source Control view. That's how VS Code draws gutter markers. The entry has no commit box and no actions.
 
-  ```json
-  "stitch.svn.urlMap": { "svn://svn": "http://svn/repos" }
-  ```
+For Git files, the gutter and Open Changes come from VS Code's built-in Git extension.
 
-  This maps `svn://svn/project` to `http://svn/repos/project`. Prefixes match on whole path segments, longest first. Stitch checks that the mapped URL is the same repository (by UUID) and says so if it isn't.
+## SVN history
 
-Known limitations:
+History is read over http(s) from the server, using the same protocol the svn client uses:
 
-- Incoming revisions are found by the file's current path; if it moved on the server, they're not listed (the separator says the path is gone).
-- Servers that need a login, `file://` repositories, and servers older than 1.7 aren't supported; the view says which applies.
-- Inside an expanded merge, the file's path on the branch is inferred from the revision's changed paths (same file name, longest matching path suffix).
+- **Merges** expand to the revisions they merged, as in `svn log -g`.
+- **Diff with Working File** and **Open This Revision** show keywords expanded (on svn 1.8+ servers), so they line up with your working file.
+- **Light on the server.** Stitch never polls and has no timers. It asks the server about a file when you open it, and then at most once per `stitch.svn.refreshInterval` (default 60 s) however often you switch files or refocus the window. A server that failed isn't asked again until that interval has passed. Merge lookups run once per file per session. **Refresh** always asks the server.
 
-## Commands
+### `svn://` and `svn+ssh://` working copies
 
-All are read-only: Open Changes, Refresh, Choose Starting Branch, Load More, Diff with Previous, Diff with Working File, Open This Revision, Copy Revision.
+History is only read over http(s), so map the `svn://` URL to the server's http(s) URL in your user settings:
 
-The one exception is **Fetch** (git only, cloud icon in the history view's title). It runs `git fetch <remote>` for the current branch's upstream, which updates `origin/…` and adds objects, but never touches your working tree, index, branches or HEAD. It doesn't prune, recurse into submodules, run hooks, or start gc/maintenance, and it never prompts for credentials. It runs only when you click it, only in trusted workspaces, and isn't offered for repositories on network paths (`stitch.git.fetchExcludePaths`, `stitch.git.fetchLocalDrives`).
+```json
+"stitch.svn.urlMap": { "svn://svn": "http://svn/repos" }
+```
+
+This maps `svn://svn/project` to `http://svn/repos/project`. Prefixes match on whole path segments, longest first. Stitch checks that the mapped URL serves the same repository (by UUID). Gutter diffs and Open Changes work without a mapping.
 
 ## Settings
 
-| Setting | Default | |
+| Setting | Default | Description |
 |---|---|---|
+| `stitch.logLimit` | `40` | History entries per page |
+| `stitch.timeoutMs` | `15000` | Timeout per git command or server request, in ms |
 | `stitch.svn.urlMap` | `{}` | `svn://` → http(s) URL prefixes, for SVN history |
-| `stitch.svn.refreshInterval` | `60` | minimum seconds between automatic SVN server queries for the same file |
-| `stitch.git.path` | `git` | git executable |
-| `stitch.git.fetchExcludePaths` | `["/drives/", "/mnt/", "/smb"]` | no Fetch button for repositories under these folders (whole path segments); on Linux, network mounts (`cifs`, `nfs`, `sshfs`, …) are excluded too |
-| `stitch.git.fetchLocalDrives` | `["C:", "D:"]` | Windows: Fetch is offered only on these drives (never on UNC paths) |
-| `stitch.logLimit` | `50` | entries per page |
-| `stitch.timeoutMs` | `15000` | timeout per git/server request |
+| `stitch.svn.refreshInterval` | `60` | Minimum seconds between automatic server queries for the same file |
+| `stitch.git.path` | `git` | The git executable |
+| `stitch.git.fetchExcludePaths` | `["/drives/", "/mnt/", "/smb"]` | No Fetch button for repositories under these folders. On Linux, network mounts (`cifs`, `nfs`, `sshfs`, …) are excluded too |
+| `stitch.git.fetchLocalDrives` | `["C:", "D:"]` | Windows: Fetch is offered only on these drives, never on UNC paths |
 
-## Untrusted workspaces
+## Safety
 
-Stitch stays enabled in Restricted Mode (folders you haven't trusted), because opening a repository with it can't run code from that repository:
+**Read-only by construction, not just by omission:**
 
-- git runs with repository-configured programs switched off (fsmonitor, textconv, external diff, signature checks), only read subcommands, and no pager.
-- The Fetch button is hidden in Restricted Mode: a fetch uses the repository's configured transport (`core.sshCommand`, `remote.*.uploadpack`, credential helpers), which could run a program.
-- svn needs no program at all; `.svn/` is parsed in-process (sql.js runs SQLite as sandboxed WebAssembly).
+- Git runs only read subcommands, with repository-configured programs (fsmonitor, textconv, external diff, signature checks) switched off.
+- SVN requests to the server are limited to read methods. Anything else is refused before a connection is opened.
+- `.svn/` is only read. `wc.db` is opened read-only without locks, so svn clients and other tools aren't blocked, which matters on network drives.
+- Revision content is served from memory. No temporary files are written.
+- The test suite checks all of this, including that `.git/` and `.svn/` are byte-for-byte unchanged afterwards.
+
+**Restricted Mode (untrusted folders).** Stitch stays enabled, because opening a repository with it can't run code from that repository:
+
+- Git's repository-configured programs are switched off, as above. The Fetch button is hidden, since a fetch uses the repository's configured transport (`core.sshCommand`, credential helpers), which could run a program.
+- SVN needs no program at all.
 - `stitch.git.path` and `stitch.svn.urlMap` are machine-scoped, so a folder's `.vscode/settings.json` can't change which git runs or where requests go.
-- Commit messages and paths are shown as plain, escaped text; tooltips are never trusted markdown.
+- Commit messages and paths are shown as plain text.
 
-One thing an untrusted folder *can* influence: an SVN working copy records its server URL, so opening a file in a crafted working copy makes Stitch send read-only, anonymous `OPTIONS`/`GET`/`REPORT` requests to that URL (no credentials are ever sent).
+One thing an untrusted folder *can* influence: an SVN working copy records its server URL, so opening a file in a crafted working copy makes Stitch send read-only, anonymous requests to that URL. No credentials are ever sent.
 
-## Install
+## Known limitations
 
-Build a package and install it (on this or another machine):
+**Git**
+- Merges made by `git pull` without rebase (`Merge branch 'main' of …`) have their parents swapped, so the first parent is your local work. They're labelled *pull merge*, and the remote's trunk appears under them.
+- Repositories that only squash or rebase have no merges, so the view is a flat list.
 
-```sh
-npm install
-npm run package          # → dist/stitch-0.0.2.vsix
-code --install-extension dist/stitch-0.0.2.vsix
-```
-
-Or, in VS Code: Extensions view → `…` → *Install from VSIX…*.
+**SVN**
+- Servers that need a login, `file://` repositories, and servers older than 1.7 aren't supported for history. The view says which applies.
+- Incoming revisions are found by the file's current path. If the file moved on the server, they aren't listed (the separator says the path is gone).
+- `$Date$` is expanded in your local time zone. If the client that last updated the file ran in a different zone, that line shows as changed.
+- Property-only changes don't count as modifications.
+- svn 1.15 working copies without pristine copies (`store-pristine = no`) and svn ≤ 1.3 working copies aren't supported.
 
 ## Troubleshooting
 
-- **See what Stitch is doing:** Output panel → *Stitch*. Every git command and SVN request is logged with its result and timing; failures are logged as warnings.
-- **"Server unreachable" or a timeout:** check the URL in the log. Stitch tries again when the window regains focus, or press Refresh in the view. Slow servers or shares: raise `stitch.timeoutMs`.
-- **"Add a URL mapping for svn://…":** the working copy was checked out with `svn://`; see `stitch.svn.urlMap` above. "Points at a different repository" means the mapped URL serves another repository (UUID mismatch).
+- **See what Stitch is doing:** Output panel → *Stitch*. Every git command and server request is logged with its result and timing.
+- **"Server unreachable" or a timeout:** check the URL in the log. Stitch tries again when the window regains focus, or press Refresh. For slow servers or shares, raise `stitch.timeoutMs`.
+- **"Add a URL mapping for svn://…":** the working copy was checked out with `svn://`; see [above](#svn-and-svnssh-working-copies). "Points at a different repository" means the mapped URL serves another repository.
 - **"The server needs a login":** only anonymous read is supported.
-- **git "refuses to read this repository because another user owns it"** (common on network shares): run the `git config --global --add safe.directory …` command shown. Stitch shows it but never runs it.
-- **Gutter or history stale after an `svn update`, commit or `git pull` in a terminal:** Stitch doesn't use file watchers (they're unreliable on network drives). It re-checks when the window regains focus, on save, when you switch files, and on Refresh.
+- **"The working copy may be damaged" or "looks incomplete":** run `svn cleanup` in it (or check out again). Stitch shows the suggestion but never runs it.
+- **git "refuses to read this repository because another user owns it"** (common on network shares): run the `git config --global --add safe.directory …` command shown. Stitch never runs it for you.
+- **Gutter or history out of date after an `svn update`, commit or `git pull` in a terminal:** Stitch doesn't use file watchers, which are unreliable on network drives. It checks again when the window regains focus, when you save, when you switch files, and on Refresh.
+
+## Install from a VSIX
+
+```sh
+npm install
+npm run package          # → dist/stitch-<version>.vsix
+code --install-extension dist/stitch-<version>.vsix
+```
+
+Or, in VS Code: Extensions view → `…` → *Install from VSIX…*.
 
 ## Development
 
 ```sh
 npm install
-npm test        # unit + fixture tests (needs git and tar; the SVN server tests use podman and skip without it)
-test/fixtures/make-svn-fixtures.sh   # rebuild the SVN fixtures (needs podman)
+npm test        # needs git and tar; the SVN server tests use podman and are skipped without it
 npm run build   # bundle to dist/
-npm run package # .vsix in dist/
 ```
 
-Press F5 in VS Code to run the extension in a development host.
+Press F5 in VS Code to run the extension in a development host. See [docs/CONTEXT.md](docs/CONTEXT.md) for how Stitch is built and why.
 
-### Read-only safeguards
+## License
 
-- All git calls go through `src/git/exec.ts`: a subcommand allowlist (`rev-parse`, `rev-list`, `log`, `show`, `cat-file`, `for-each-ref`), banned arguments (`--output`, `--ext-diff`, `--textconv`), and config overrides so repository-configured programs (fsmonitor, textconv, external diff, signature checks) never run.
-- All SVN network calls go through `request()` in `src/svn/dav.ts`, which allows only `OPTIONS`, `GET` and `log-report` `REPORT`s and refuses anything else before connecting.
-- `.svn/` is only read. `wc.db` is read into memory and opened by sql.js from that copy, never from the file, and never written back.
-- Revision content is served by a read-only `stitch:` file system from memory; no temp files.
-- Tests check that `.git/` and `.svn/` are byte-for-byte unchanged after use, that no SQLite database is ever exported, that only `dav.ts` imports network modules and refuses write methods without opening a connection, that no source file calls an fs write API or starts processes outside `exec.ts`, and that only the read commands are contributed.
-- The exception: Fetch calls `gitFetch()` in `exec.ts`, a fixed `git fetch` argv outside the allowlist. Tests check it's called only from the `stitch.fetch` command, that the remote can't be an option, and (against a real local remote) that it doesn't prune or run hooks and leaves HEAD, branches, index and working files alone.
+[MIT](LICENSE)

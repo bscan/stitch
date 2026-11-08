@@ -38,7 +38,11 @@ export interface SvnWorkingCopy {
 }
 
 export class SvnError extends Error {
-  constructor(message: string, readonly kind: "unsupported" | "notVersioned" | "other" = "other") {
+  /**
+   * "damaged": the .svn folder is broken or half-written (the message says what to do);
+   * "unavailable": it couldn't be read in time (a slow or unreachable drive).
+   */
+  constructor(message: string, readonly kind: "unsupported" | "notVersioned" | "damaged" | "unavailable" | "other" = "other") {
     super(message);
   }
 }
