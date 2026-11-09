@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.5
+
+- New extension icon.
+
 ## 0.0.4
 
 - The SVN **Open Changes** editor button now uses a different icon from the built-in Git one, so the two can be told apart when both appear (for example, when a stray `.git` folder sits in an SVN working copy).
