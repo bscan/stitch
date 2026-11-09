@@ -39,7 +39,7 @@
         "command": "stitch.openChanges",
         "title": "Open Changes",
         "category": "Stitch",
-        "icon": "$(git-compare)"
+        "icon": "$(diff)"
       },
       {
         "command": "stitch.refresh",

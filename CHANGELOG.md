@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The SVN **Open Changes** editor button now uses a different icon from the built-in Git one, so the two can be told apart when both appear (for example, when a stray `.git` folder sits in an SVN working copy).
+- The Stitch History view no longer has a Collapse All button. Nothing in the view expands on its own, so it was rarely needed.
+
 ## 0.0.3
 
 - **Copy Diff** (right-click a history row, or a file under a commit): copies the commit's details and a unified diff of just that file, in `git log -p` style for Git and `svn log` + `svn diff` style for SVN.

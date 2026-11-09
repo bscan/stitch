@@ -111,7 +111,6 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
   constructor(private readonly limit: () => number) {
     this.view = vscode.window.createTreeView("stitch.history", {
       treeDataProvider: this,
-      showCollapseAll: true,
     });
     this.view.message = "Open a file to see its history.";
   }
