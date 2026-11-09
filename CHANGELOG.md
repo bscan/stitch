@@ -4,6 +4,7 @@
 
 - The SVN **Open Changes** editor button now uses a different icon from the built-in Git one, so the two can be told apart when both appear (for example, when a stray `.git` folder sits in an SVN working copy).
 - The Stitch History view no longer has a Collapse All button. Nothing in the view expands on its own, so it was rarely needed.
+- New marketplace name, Stitch: SVN & Git File History, with a clearer description and search keywords.
 
 ## 0.0.3
 

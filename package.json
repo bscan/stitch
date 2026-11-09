@@ -1,7 +1,7 @@
 {
   "name": "stitch",
-  "displayName": "Stitch",
-  "description": "Read-only file history, gutter diffs and Open Changes for SVN and Git files, opened anywhere.",
+  "displayName": "Stitch: SVN & Git File History",
+  "description": "See who changed a file, when and why. Works with SVN and Git, no svn install needed.",
   "version": "0.0.4",
   "publisher": "bscan",
   "license": "MIT",
@@ -12,6 +12,15 @@
   "engines": {
     "vscode": "^1.101.0"
   },
+  "keywords": [
+    "svn",
+    "subversion",
+    "git",
+    "history",
+    "file history",
+    "log",
+    "diff"
+  ],
   "categories": [
     "SCM Providers"
   ],
