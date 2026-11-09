@@ -2,7 +2,7 @@
   "name": "stitch",
   "displayName": "Stitch",
   "description": "Read-only file history, gutter diffs and Open Changes for SVN and Git files, opened anywhere.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "bscan",
   "license": "MIT",
   "repository": {
