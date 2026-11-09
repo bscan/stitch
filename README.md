@@ -5,7 +5,7 @@
 - **Stitch History** in the Explorer sidebar: the history of the file in the active editor, with merges you can expand.
 - **SVN gutter diffs and Open Changes**: compare the editor with BASE, read straight from `.svn/`, so it works offline.
 - **Incoming changes**: commits on the server (SVN) or upstream branch (Git) that you don't have yet, shown above a "your working copy" / "your branch" line.
-- **Never writes.** There are no commit, update, revert or cleanup commands. Stitch never changes a working copy, a repository, or git/svn configuration, and it never upgrades old SVN working copies. The one exception is the optional Git **Fetch** button ([below](#fetch-git)).
+- **Never writes.** There are no commit, update, revert or cleanup commands. Stitch never changes a working copy, a repository, or git/svn configuration, and it never upgrades old SVN working copies. The one exception is the optional Git **Fetch** button ([below](#fetch-git)). (SVN **Revert Change** only edits the open editor. Nothing is saved until you save.)
 
 ## Requirements
 
@@ -61,6 +61,7 @@ For a file in an SVN working copy, Stitch compares the editor with BASE (the cop
 
 - **Gutter markers**, like the built-in Git ones.
 - **Open Changes** (in the editor title bar when the file differs from BASE) opens a BASE ↔ working file diff.
+- **Revert Change**: click a gutter marker, then the revert button in the peek's title bar, to put that hunk back to BASE. Unlike the built-in Git button, it only edits the editor and doesn't save, so the file on disk changes only when you save. Undo brings the change back.
 - **Keywords** set in `svn:keywords` (`$Id$`, `$Rev$`, `$Date$` and the rest, including fixed-width and custom keywords) are expanded in BASE the way the svn client does it, so keyword lines don't show up as changes.
 - Added files compare against an empty file, and copied files against their copy source.
 - Non-UTF-8 files (common in old repositories) are decoded the same way on both sides, so they don't show as completely changed.

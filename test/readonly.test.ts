@@ -129,7 +129,27 @@ describe("read-only guarantee", function () {
       "stitch.openRevision",
       "stitch.pickRef",
       "stitch.refresh",
+      "stitch.revertChange", // edits the editor buffer only: see the next test
     ]);
+  });
+
+  it("Revert Change only edits the editor buffer: nothing in src/ saves a document", function () {
+    // Saving is left to the user, so Stitch itself still never writes the file.
+    const save = /\.save\s*\(|saveAll\s*\(|\.saveAs\s*\(/;
+    for (const f of files) {
+      assert.ok(!save.test(readFileSync(f, "utf8")), `${path.relative(ROOT, f)} saves a document`);
+    }
+    // applyEdit is used in one place: the stitch.revertChange command.
+    for (const f of files) {
+      const text = readFileSync(f, "utf8");
+      const at = text.indexOf("applyEdit(");
+      if (at === -1) continue;
+      assert.strictEqual(f, path.join(SRC, "extension.ts"), `${path.relative(ROOT, f)} applies workspace edits`);
+      const cmd = text.indexOf('registerCommand("stitch.revertChange"');
+      const next = text.indexOf("registerCommand(", cmd + 1);
+      assert.ok(cmd !== -1 && at > cmd && (next === -1 || at < next), "applyEdit is called inside stitch.revertChange");
+      assert.strictEqual(text.indexOf("applyEdit(", at + 1), -1, "applyEdit is called once");
+    }
   });
 
   it("the only git write is the Fetch button's fixed `git fetch <remote>`", function () {

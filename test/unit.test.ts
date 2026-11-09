@@ -11,6 +11,7 @@ import { fetchBlockedReason, FetchPolicy, mountFor } from "../src/git/fetchPolic
 import { Resolver } from "../src/resolver";
 import { changedFiles, MAX_FILES, svnDisplayPath, toCommit } from "../src/svn/svnHistory";
 import { LogItem } from "../src/svn/dav";
+import { lineSegments, revertHunk } from "../src/revertHunk";
 
 const rec = (fields: string[], changes: string[]) => "\x1e" + fields.join("\0") + "\0\0\n" + changes.join("\0") + "\0";
 
@@ -398,5 +399,52 @@ describe("Copy Diff (patch.ts)", function () {
     );
     const bin = formatDiff({ vcs: "git", commit: commit(), left: { side: left, text: undefined }, right: { side: right, text: "x" } });
     assert.match(bin, /Binary files \/dev\/null and b\/trunk\/a.txt differ\n$/);
+  });
+});
+
+describe("revertHunk", function () {
+  // Apply the revert of hunk `c` to `mod` and check it gives `want`.
+  const check = (orig: string, mod: string, c: [number, number, number, number], want: string) => {
+    const r = revertHunk(orig, mod, {
+      originalStartLineNumber: c[0],
+      originalEndLineNumber: c[1],
+      modifiedStartLineNumber: c[2],
+      modifiedEndLineNumber: c[3],
+    });
+    assert.strictEqual(mod.slice(0, r.start) + r.text + mod.slice(r.end), want);
+  };
+
+  it("splits lines like VS Code", function () {
+    assert.deepStrictEqual(lineSegments("a\nb\r\nc"), ["a\n", "b\r\n", "c"]);
+    assert.deepStrictEqual(lineSegments("a\n"), ["a\n", ""]);
+    assert.deepStrictEqual(lineSegments(""), [""]);
+  });
+
+  it("reverts a changed line", function () {
+    check("a\nb\nc\n", "a\nX\nY\nc\n", [2, 2, 2, 3], "a\nb\nc\n");
+    check("a\nb", "a\nX", [2, 2, 2, 2], "a\nb");
+    check("a\r\nb\r\nc\r\n", "a\r\nX\r\nc\r\n", [2, 2, 2, 2], "a\r\nb\r\nc\r\n");
+  });
+
+  it("removes added lines", function () {
+    check("a\nc\n", "a\nX\nY\nc\n", [1, 0, 2, 3], "a\nc\n");
+    check("a\nb\n", "X\na\nb\n", [0, 0, 1, 1], "a\nb\n");
+    check("a", "a\nX", [1, 0, 2, 2], "a");
+    check("a\nb\n", "a\nb\nX\n", [2, 0, 3, 3], "a\nb\n");
+  });
+
+  it("restores deleted lines", function () {
+    check("a\nb\nc\n", "a\nc\n", [2, 2, 1, 0], "a\nb\nc\n");
+    check("a\nb\n", "b\n", [1, 1, 0, 0], "a\nb\n");
+    check("a\nb", "a", [2, 2, 1, 0], "a\nb");
+    check("a\nb\nc\n", "a\n", [2, 3, 1, 0], "a\nb\nc\n");
+  });
+
+  it("keeps the line break when the original's last line replaces a middle one", function () {
+    check("a\nb", "a\nX\nc", [2, 2, 2, 2], "a\nb\nc");
+  });
+
+  it("leaves other hunks alone", function () {
+    check("a\nb\nc\nd\n", "A\nb\nC\nd\n", [3, 3, 3, 3], "A\nb\nc\nd\n");
   });
 });

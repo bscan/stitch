@@ -11,6 +11,7 @@ import { fetchNote, staleFetchMs } from "./history/format";
 import { decodeText, formatDiff, SideText } from "./history/patch";
 import { GitSource } from "./history/source";
 import { SvnQuickDiff } from "./quickDiff";
+import { LineChange, revertHunk } from "./revertHunk";
 import { log, setLogSink } from "./log";
 import { Resolver } from "./resolver";
 import { DavClient, RepoInfo } from "./svn/dav";
@@ -535,6 +536,32 @@ export function activate(context: vscode.ExtensionContext): void {
       const name = path.basename(file.fsPath);
       const left = base.node.schedule === "added" ? "(added)" : `BASE r${base.node.revision}`;
       await vscode.commands.executeCommand("vscode.diff", base.uri, file, `${name} (${left} ↔ Working)`);
+    }),
+
+    // The quick diff peek's "Revert Change" button (scm/change/title). VS Code passes the
+    // editor's URI, every hunk in it, and the index of the one shown. This only edits the
+    // editor buffer: nothing is saved, so the file on disk changes only if the user saves,
+    // and Undo puts the hunk back.
+    vscode.commands.registerCommand("stitch.revertChange", async (uri?: vscode.Uri, changes?: LineChange[], index?: number) => {
+      if (!(uri instanceof vscode.Uri) || !Array.isArray(changes) || typeof index !== "number") return;
+      const change = changes[index];
+      if (!change) return;
+      const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
+      if (!editor) return;
+      let base;
+      try {
+        base = await svnBaseUri(uri);
+      } catch (e) {
+        void vscode.window.showWarningMessage(describeError(e));
+        return;
+      }
+      if (!base) return;
+      const doc = editor.document;
+      const original = await vscode.workspace.openTextDocument(base.uri);
+      const r = revertHunk(original.getText(), doc.getText(), change);
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(doc.uri, new vscode.Range(doc.positionAt(r.start), doc.positionAt(r.end)), r.text);
+      await vscode.workspace.applyEdit(edit);
     }),
 
     vscode.commands.registerCommand("stitch.loadMore", (node: Node) => {

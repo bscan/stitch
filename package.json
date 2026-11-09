@@ -52,6 +52,12 @@
         "icon": "$(diff)"
       },
       {
+        "command": "stitch.revertChange",
+        "title": "Revert Change",
+        "category": "Stitch",
+        "icon": "$(discard)"
+      },
+      {
         "command": "stitch.refresh",
         "title": "Refresh",
         "category": "Stitch",
@@ -156,6 +162,10 @@
           "when": "stitch.kind == svn"
         },
         {
+          "command": "stitch.revertChange",
+          "when": "false"
+        },
+        {
           "command": "stitch.loadMore",
           "when": "false"
         },
@@ -193,6 +203,12 @@
           "command": "stitch.openChanges",
           "when": "stitch.svnModified && resourceScheme == file",
           "group": "navigation"
+        }
+      ],
+      "scm/change/title": [
+        {
+          "command": "stitch.revertChange",
+          "when": "originalResourceScheme == stitch"
         }
       ]
     },
