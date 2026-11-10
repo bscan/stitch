@@ -162,4 +162,4 @@ The adopted alternative is a first-parent walk at every level, with lazy per-mer
 
 - **HTTP Basic auth** is not needed now (the servers allow anonymous read). It's a possible later addition.
 - **Incoming after a move on the server:** incoming revisions are looked up by the file's BASE path at HEAD; if the file moved on the server, only a note is shown. Following it would need `get-locations` or a forward search, which svn doesn't offer cheaply.
-- **Other feature ideas offered and not yet chosen:** compare two selected revisions, blame/annotate (large for svn: `file-revs` + client-side deltas), folder history, a status-bar item for svn files, history filter, "open in web viewer", explorer badges, HTTP Basic auth.
+- **Feature ideas offered and not yet chosen:** see [IDEAS.md](IDEAS.md).

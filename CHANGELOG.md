@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.6
 
 - **Unpushed** marker (Git): commits on your branch that its upstream doesn't have yet are tagged "unpushed", also on later pages and under expanded merges. A separator (`──── upstream: origin/main ────`) sits between them and the commits the upstream has. Like incoming commits, this reflects the last fetch.
 - **Revert Change** for SVN gutter diffs: click a gutter marker, then the revert button in the peek, to put that change back to BASE. It edits the editor only and doesn't save, so the file on disk is unchanged until you save, and Undo brings the change back.
