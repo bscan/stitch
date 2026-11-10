@@ -5,7 +5,7 @@ process.env.TZ = "UTC"; // the fixture client ran in UTC; $Date$ uses local time
 import * as assert from "assert";
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
-import { closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
 import { DatabaseSync } from "node:sqlite";
 import * as os from "os";
 import * as path from "path";
@@ -126,6 +126,42 @@ for (const fixture of ["svn16", "svn18", "svn114"]) {
 
     it("leaves .svn untouched", function () {
       assert.strictEqual(hashTree(path.join(wc, ".svn")), svnHash);
+    });
+  });
+}
+
+for (const fixture of ["svn16", "svn114"]) {
+  describe(`BASE change detection: ${fixture}`, function () {
+    let tmp: string;
+    let wc: string;
+
+    beforeEach(function () {
+      tmp = mkdtempSync(path.join(os.tmpdir(), `stitch-changed-${fixture}-`));
+      execFileSync("tar", ["xzf", path.join(FIXTURES, `${fixture}.tar.gz`), "-C", tmp]);
+      wc = path.join(tmp, "wc");
+    });
+
+    afterEach(function () {
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    /** What `svn update` does to the metadata, as far as change detection can tell. */
+    const touchMetadata = () => {
+      const db = path.join(wc, ".svn", "wc.db");
+      const meta = existsSync(db) ? db : path.join(wc, ".svn", "entries");
+      const t = new Date(statSync(meta).mtimeMs + 5000);
+      utimesSync(meta, t, t);
+    };
+
+    it("still reports a change after a read saw the new metadata", async function () {
+      const repo = await SvnRepo.open(wc);
+      assert.ok(await repo.node(path.join(wc, "a.txt")));
+      assert.strictEqual(await repo.changed(), false);
+      touchMetadata();
+      // An editor switch reads the file's node before the BASE check runs.
+      assert.ok(await repo.node(path.join(wc, "a.txt")));
+      assert.strictEqual(await repo.changed(), true);
+      assert.strictEqual(await repo.changed(), false, "reported once");
     });
   });
 }

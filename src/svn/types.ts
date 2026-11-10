@@ -33,7 +33,7 @@ export interface SvnWorkingCopy {
   readonly format: string;
   node(relPath: string): Promise<SvnNode | undefined>;
   pristine(node: SvnNode): Promise<Uint8Array>;
-  /** Whether the metadata on disk changed since it was last read. */
+  /** Whether the metadata on disk changed since the previous call (the first read counts as one). Reads don't reset it. */
   changed(): Promise<boolean>;
 }
 

@@ -240,13 +240,20 @@ export function activate(context: vscode.ExtensionContext): void {
   const checkSvnMetadata = async () => {
     let any = false;
     for (const repo of svnByRoot.values()) {
-      if (await repo.changed()) {
+      if (await repo.changed().catch(() => false)) {
         fsProvider.baseChanged(repo.root);
         any = true;
       }
     }
     return any;
   };
+
+  /** checkSvnMetadata, then follows the current SVN file again if BASE moved (its history starts at BASE). */
+  const recheckSvn = () =>
+    checkSvnMetadata().then((changed) => {
+      void updateSvnModified();
+      if (changed && svnCurrent) followLast();
+    });
 
   /** `stale()` turns true once a newer `follow` started: from then on this call must not touch the view or context keys. */
   const followSvn = async (file: vscode.Uri, dir: string, stale: () => boolean) => {
@@ -441,6 +448,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.window.onDidChangeActiveTextEditor(() => {
       followActive();
+      // `svn update` in the integrated terminal leaves the window focused: check BASE on file switches too.
+      if (svnByRoot.size) void checkSvnMetadata();
       // Autofetch can move origin/… while the window stays focused: re-check on file switches too.
       void refreshIfMoved();
     }),
@@ -450,18 +459,23 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!history.current) followLast();
       void refreshIfMoved();
       void refreshIfServerMoved();
-      void checkSvnMetadata().then((changed) => {
-        void updateSvnModified();
-        if (changed && svnCurrent) followLast(); // an update may have moved BASE
-      });
+      void recheckSvn(); // an update may have moved BASE
     }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (svnCurrent && doc.uri.toString() === svnCurrent.file.toString()) void updateSvnModified();
     }),
     vscode.workspace.onDidChangeTextDocument((e) => {
+      const doc = e.document;
+      // A clean file whose text changed was reloaded from disk (or undone back to clean).
+      // After `svn update` that's the first sign BASE moved, while the gutter still compares
+      // the new text with the old BASE: check now rather than at the next focus or file switch.
+      if (!doc.isDirty && e.contentChanges.length && doc.uri.scheme === "file" && svnByRoot.size) {
+        void recheckSvn();
+        return;
+      }
       // Becoming dirty shows Open Changes at once; becoming clean (undo) needs a disk check.
-      if (svnCurrent && e.document.uri.toString() === svnCurrent.file.toString()) {
-        if (e.document.isDirty) setSvnModified(true);
+      if (svnCurrent && doc.uri.toString() === svnCurrent.file.toString()) {
+        if (doc.isDirty) setSvnModified(true);
         else void updateSvnModified();
       }
     }),

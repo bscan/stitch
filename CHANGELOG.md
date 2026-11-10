@@ -8,6 +8,7 @@
 - Faster SVN history when opening several files in a row: the server's newest revision number is reused for 60 seconds (was 10), which saves one request per file. **Refresh** always asks again.
 - Fixed: SVN history now follows a file through a revision that moved or copied its folder (or created its branch) and edited the file in the same commit. Before, diffs for that revision and older ones failed with "not found", and so could **Load more**.
 - Fixed: **Refresh** (and changing a Stitch setting) on an SVN file no longer leaves the view stuck on "Reloading…" when a diff tab or the Settings editor is active.
+- Fixed: after `svn update`, SVN gutter markers could keep showing the changes that came in as if they were local edits, until the window was reloaded. They now clear as soon as the updated file reloads, and at the latest on the next file switch or window focus. This mostly affected updates run from VS Code's integrated terminal.
 - Fixed: switching quickly between files no longer lets a slow lookup for the file you left replace the history of the file you are on.
 
 ## 0.0.5

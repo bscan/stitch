@@ -107,6 +107,7 @@ export function isoToMicros(s: string | undefined): number | undefined {
 export class Wc16 implements SvnWorkingCopy {
   readonly format = "1.4–1.6";
   private readonly dirs = new Map<string, Promise<Dir>>();
+  /** Each entries file read, as it was when changed() last looked (or when first read). Reads don't move it. */
   private readonly seen = new Map<string, { mtimeMs: number; size: number }>();
 
   constructor(readonly root: string) {}
@@ -151,7 +152,7 @@ export class Wc16 implements SvnWorkingCopy {
       const self = entries[0];
       const map = new Map<string, Entry>();
       for (const e of entries.slice(1)) if (e.name) map.set(e.name, e);
-      this.seen.set(rel, { mtimeMs: st.mtimeMs, size: st.size });
+      if (!this.seen.has(rel)) this.seen.set(rel, { mtimeMs: st.mtimeMs, size: st.size });
       return { mtimeMs: st.mtimeMs, size: st.size, entries: map, self };
     });
     p.catch(() => this.dirs.delete(rel));
@@ -159,16 +160,21 @@ export class Wc16 implements SvnWorkingCopy {
     return p;
   }
 
+  /** Whether an entries file read so far changed since the previous call (see Wc17.changed()). */
   async changed(): Promise<boolean> {
+    let any = false;
     for (const [rel, s] of this.seen) {
       try {
         const st = await fs.stat(path.join(this.root, rel, ".svn", "entries"));
-        if (st.mtimeMs !== s.mtimeMs || st.size !== s.size) return true;
+        if (st.mtimeMs !== s.mtimeMs || st.size !== s.size) {
+          this.seen.set(rel, { mtimeMs: st.mtimeMs, size: st.size });
+          any = true;
+        }
       } catch {
-        return true;
+        any = true;
       }
     }
-    return false;
+    return any;
   }
 
   private async props(dirRel: string, name: string, entry: Entry): Promise<Map<string, string>> {

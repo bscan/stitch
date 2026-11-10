@@ -46,8 +46,10 @@ const CLEANUP = "Running svn cleanup (or a fresh checkout) should fix it.";
 
 export class Wc17 implements SvnWorkingCopy {
   readonly format = "1.7+";
-  /** Stamp of wc.db at the last successful read (see changed()). */
+  /** Stamp of wc.db at the last successful read. */
   private stamp?: string;
+  /** Stamp of wc.db when changed() last looked (or at the first read). Reads don't move it. */
+  private checked?: string;
   private warnedQueue?: string;
 
   constructor(
@@ -59,14 +61,23 @@ export class Wc17 implements SvnWorkingCopy {
     return path.join(this.root, ".svn", "wc.db");
   }
 
-  /** Whether the metadata changed since it was last read (cheap: one stat). */
+  /**
+   * Whether wc.db changed since the previous call (cheap: one stat). Measured
+   * against the last check, not the last read: a read after `svn update` (an
+   * editor switch looking up the file) must not hide the update from the caller
+   * that drops cached BASE text.
+   */
   async changed(): Promise<boolean> {
-    if (this.stamp === undefined) return false;
+    if (this.checked === undefined) return false;
+    let now: string;
     try {
-      return stampOf(await fs.stat(this.dbPath, { bigint: true })) !== this.stamp;
+      now = stampOf(await fs.stat(this.dbPath, { bigint: true }));
     } catch {
       return true;
     }
+    if (now === this.checked) return false;
+    this.checked = now;
+    return true;
   }
 
   private async query(relPath: string): Promise<{ version: number; reposUuid?: string; queued: number; rows: NodeRow[] }> {
@@ -86,6 +97,7 @@ export class Wc17 implements SvnWorkingCopy {
       throw this.explain(e);
     }
     this.stamp = res.stamp;
+    this.checked ??= res.stamp;
     const [[ver], repos, [queue], rows] = res.results as [Row[], Row[], Row[], Row[]];
     return {
       version: Number(ver?.user_version ?? 0),
