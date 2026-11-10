@@ -329,6 +329,105 @@ describe("git incoming commits (upstream not in the branch)", function () {
   });
 });
 
+describe("git unpushed commits (in the branch, not in its upstream)", function () {
+  let dir: string;
+  let repo: GitRepo;
+  let gitBefore: Map<string, string>;
+
+  // Test-only setup with git directly: main ahead of origin/main, which it has merged.
+  //   origin/main: c1 ─ c2 ─ r1
+  //   main:        c1 ─ c2 ─ l1 ─ pm (pull merge of origin/main) ─ lm (merge of local s1) ─ l2
+  before(async function () {
+    const { execFileSync } = await import("child_process");
+    const { writeFileSync, appendFileSync } = await import("fs");
+    dir = mkdtempSync(path.join(tmpdir(), "stitch-ahead-"));
+    const g = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: dir,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, GIT_AUTHOR_NAME: "A", GIT_AUTHOR_EMAIL: "a@x", GIT_COMMITTER_NAME: "A", GIT_COMMITTER_EMAIL: "a@x" },
+      }).trim();
+    const commit = (name: string) => {
+      appendFileSync(path.join(dir, "f.txt"), `${name}\n`);
+      g("add", "f.txt");
+      g("commit", "-q", "-m", name);
+    };
+    g("init", "-q", "-b", "main");
+    commit("c1");
+    commit("c2");
+    g("checkout", "-q", "-b", "up");
+    commit("r1");
+    g("update-ref", "refs/remotes/origin/main", "up");
+    g("checkout", "-q", "main");
+    g("branch", "-q", "-D", "up");
+    commit("l1");
+    assert.throws(() => g("merge", "-q", "origin/main")); // both sides appended a line
+    writeFileSync(path.join(dir, "f.txt"), "c1\nc2\nr1\nl1\n");
+    g("add", "f.txt");
+    g("commit", "-q", "-m", "Merge remote-tracking branch 'origin/main'");
+    g("checkout", "-q", "-b", "side");
+    commit("s1");
+    g("checkout", "-q", "main");
+    g("merge", "-q", "--no-ff", "-m", "lm", "side");
+    g("branch", "-q", "-D", "side");
+    commit("l2");
+    g("config", "remote.origin.url", "https://example.invalid/r.git");
+    g("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    g("config", "branch.main.remote", "origin");
+    g("config", "branch.main.merge", "refs/heads/main");
+    repo = (await GitRepo.open(dir, opts)).repo;
+    gitBefore = hashTree(path.join(dir, ".git"));
+  });
+
+  after(function () {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const newSource = async (ref = "HEAD") => new (await import("../src/history/source")).GitSource(repo, "f.txt", ref);
+  const marks = (commits: { subject: string; unpushed?: string }[]) => commits.map((c) => `${c.subject.slice(0, 5)}${c.unpushed ? "*" : ""}`);
+
+  it("marks the branch's commits that the upstream doesn't have", async function () {
+    const page = await (await newSource()).top(50);
+    assert.deepStrictEqual(marks(page.commits), ["l2*", "lm*", "Merge*", "l1*", "c2", "c1"]);
+    assert.match(page.commits[0].unpushed!, /Not on origin\/main yet/);
+    assert.strictEqual(page.pushedLine?.label, "upstream: origin/main");
+    assert.strictEqual(page.pushedLine?.description, "not fetched yet");
+    assert.strictEqual(page.incoming, undefined); // r1 is merged already
+  });
+
+  it("marks them on later pages and under merges too", async function () {
+    const source = await newSource();
+    const first = await source.top(2);
+    assert.deepStrictEqual(marks(first.commits), ["l2*", "lm*"]);
+    const second = await source.more(first.next, 2);
+    assert.deepStrictEqual(marks(second.commits), ["Merge*", "l1*"]);
+    assert.deepStrictEqual(marks((await source.more(second.next!, 2)).commits), ["c2", "c1"]);
+    // A local branch's commits aren't pushed; what a pull merge brought in came from the upstream.
+    assert.deepStrictEqual(marks((await source.expand(first.commits[1], first.level, 50)).commits), ["s1*"]);
+    assert.deepStrictEqual(marks((await source.expand(second.commits[0], first.level, 50)).commits), ["r1"]);
+  });
+
+  it("keeps the marks when the history is reused", async function () {
+    const source = await newSource();
+    await source.top(2);
+    const again = await source.top(2);
+    assert.deepStrictEqual(marks(again.commits), ["l2*", "lm*"]);
+    assert.strictEqual(again.pushedLine?.label, "upstream: origin/main");
+    assert.deepStrictEqual(marks((await source.more(again.next, 2)).commits), ["Merge*", "l1*"]);
+  });
+
+  it("marks nothing without an upstream (a remote ref)", async function () {
+    const page = await (await newSource("origin/main")).top(50);
+    assert.deepStrictEqual(marks(page.commits), ["r1", "c2", "c1"]);
+    assert.strictEqual(page.pushedLine, undefined);
+  });
+
+  it("leaves .git unchanged", function () {
+    assert.deepStrictEqual(hashTree(path.join(dir, ".git")), gitBefore);
+  });
+});
+
 describe("git history cache (GitSource remembers top() while the ref and upstream stay put)", function () {
   let dir: string;
   let repo: GitRepo;

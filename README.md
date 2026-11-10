@@ -44,6 +44,12 @@ Git history is shown as a trunk with merges you can expand, rather than one long
 
 **Git:** when your branch has an upstream (such as `origin/main`) with commits you haven't pulled that changed the file, they come first, tagged "incoming". The separator reads `──── your branch: main ────`, with "origin/main, fetched 12 min ago" beside it. This reflects the last fetch, whether it came from Stitch's Fetch button, VS Code's autofetch, a pull or a terminal. When the last fetch is more than an hour old (or more than two autofetch periods, if those are longer), the view title says so: `main.c · fetched 3 d ago`.
 
+### Unpushed commits (Git)
+
+The mirror of incoming: commits on your branch that its upstream doesn't have yet are tagged "unpushed". This covers every row, including later pages and the commits under an expanded merge (a local branch you merged is unpushed; what a pull merge brought in is not). A separator (`──── upstream: origin/main ────`, with "fetched 12 min ago" beside it) sits under the last unpushed commit of the top level: above it is what only you have, below it what the upstream has too. If the unpushed commits fill the first page, the separator appears once **Load more** reaches the upstream's commits; if every commit of the file is unpushed, there is none.
+
+Like incoming, it reflects the last fetch. A branch with no upstream has no marks and no separator.
+
 The view reloads when the server, your branch or its upstream moves. Stitch checks when the window regains focus and when you switch files.
 
 ### Fetch (Git)

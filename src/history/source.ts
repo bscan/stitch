@@ -55,7 +55,19 @@ export interface Incoming {
   note?: string;
 }
 
-export type TopPage = SourcePage & { level: Level; incoming?: Incoming };
+/**
+ * git: the row between the top-level commits the upstream doesn't have ("unpushed")
+ * and the ones it has. Present when the branch has unpushed commits; the view places
+ * it where the marks end, which can be on a later page.
+ */
+export interface PushedLine {
+  /** Separator row text, e.g. "upstream: origin/main". */
+  label: string;
+  description?: string;
+  tooltip: string;
+}
+
+export type TopPage = SourcePage & { level: Level; incoming?: Incoming; pushedLine?: PushedLine };
 
 
 interface GitNext {
@@ -70,6 +82,13 @@ interface GitState {
 }
 
 const stateKey = (s: GitState) => `${s.head} ${s.up?.name ?? ""} ${s.up?.hash ?? ""}`;
+
+/** The commits of the ref that its upstream doesn't have, and the tooltip line for their rows. */
+interface Unpushed {
+  revs: Set<string>;
+  note: string;
+  upName: string;
+}
 
 /** The incoming part of a remembered page, minus the text that depends on the time of the last fetch. */
 interface IncomingData {
@@ -88,7 +107,9 @@ interface IncomingData {
 export class GitSource implements HistorySource {
   readonly vcs = "git";
   /** The last successful top(): the state it was loaded at, for which limit, and the result. */
-  private last?: { state: string; limit: number; page: TopPage; incoming?: IncomingData };
+  private last?: { state: string; limit: number; page: TopPage; incoming?: IncomingData; unpushed?: Unpushed };
+  /** As of the latest top(): which commits get the "unpushed" mark, also on later pages and under merges. */
+  private unpushed?: Unpushed;
   /** The state the last top() saw (also when it failed), for moved(). */
   private checkedState?: string;
   /** Merge counts by merge, path and exclusions (immutable: they only name commits). */
@@ -132,6 +153,7 @@ export class GitSource implements HistorySource {
   /** Forgets the remembered history and merge counts: the next top() queries git again. */
   invalidate(): void {
     this.last = undefined;
+    this.unpushed = undefined;
     this.checkedState = undefined;
     this.counts.clear();
   }
@@ -141,9 +163,12 @@ export class GitSource implements HistorySource {
     const key = stateKey(state);
     if (!signal?.aborted) this.checkedState = key;
     const last = this.last;
-    if (last && last.state === key && last.limit === limit) return this.serve(last, signal);
+    if (last && last.state === key && last.limit === limit) {
+      this.unpushed = last.unpushed;
+      return this.serve(last, signal);
+    }
     let incomingFailed = false;
-    const [page, incoming] = await Promise.all([
+    const [page, incoming, unpushed] = await Promise.all([
       // From the resolved commit, so the result matches the state it's remembered under.
       this.repo.page({ from: state.head || this.ref, path: this.relPath, limit }, [], signal),
       this.incoming(limit, state, signal).catch((e) => {
@@ -151,19 +176,36 @@ export class GitSource implements HistorySource {
         if (!signal?.aborted) log.warn(`incoming commits for ${this.relPath}: ${(e as Error).message}`);
         return undefined; // history without the incoming part is still useful
       }),
+      this.findUnpushed(state, signal).catch((e) => {
+        incomingFailed = true;
+        if (!signal?.aborted) log.warn(`unpushed commits for ${this.relPath}: ${(e as Error).message}`);
+        return undefined; // likewise without the marks
+      }),
     ]);
-    const result: TopPage = { commits: page.commits, next: page.next && { req: page.next, exclude: [] }, level: [], incoming: incoming?.incoming };
-    // A cancelled load isn't a result, and one without its incoming part (a failure) is tried again next time.
-    if (!signal?.aborted && !incomingFailed) this.last = { state: key, limit, page: result, incoming };
+    if (!signal?.aborted) this.unpushed = unpushed;
+    mark(page.commits, unpushed);
+    const result: TopPage = {
+      commits: page.commits,
+      next: page.next && { req: page.next, exclude: [] },
+      level: [],
+      incoming: incoming?.incoming,
+      pushedLine: unpushed && pushedLine(unpushed.upName, await this.repo.lastFetch(signal)),
+    };
+    // A cancelled load isn't a result, and one without its incoming part or unpushed marks (a failure) is tried again next time.
+    if (!signal?.aborted && !incomingFailed) this.last = { state: key, limit, page: result, incoming, unpushed };
     return result;
   }
 
-  /** The remembered page, with the separator's fetch time as of now (one stat). */
+  /** The remembered page, with the separators' fetch time as of now (one stat). */
   private async serve(last: NonNullable<GitSource["last"]>, signal?: AbortSignal): Promise<TopPage> {
-    const inc = last.incoming;
-    if (!inc) return last.page;
+    const { incoming: inc, unpushed } = last;
+    if (!inc && !unpushed) return last.page;
     const fetched = await this.repo.lastFetch(signal);
-    return { ...last.page, incoming: { ...inc.incoming, ...fetchText(inc.upName, inc.branch, fetched) } };
+    return {
+      ...last.page,
+      incoming: inc && { ...inc.incoming, ...fetchText(inc.upName, inc.branch, fetched) },
+      pushedLine: unpushed && pushedLine(unpushed.upName, fetched),
+    };
   }
 
   /**
@@ -191,15 +233,30 @@ export class GitSource implements HistorySource {
     };
   }
 
+  /**
+   * The mirror of incoming(): the branch's commits that its upstream (as of the last
+   * fetch) doesn't have. All of them, not only this file's, in one rev-list, so rows
+   * on later pages and under merges can be marked too. Nothing to ask when there is
+   * no upstream or the branch is at it.
+   */
+  private async findUnpushed(state: GitState, signal?: AbortSignal): Promise<Unpushed | undefined> {
+    const { up, head } = state;
+    if (!up || !head || up.hash === head) return undefined;
+    const revs = await this.repo.notIn(head, up.hash, signal);
+    return revs.size > 0 ? { revs, upName: up.name, note: `Not on ${up.name} yet (as of the last fetch); a push sends it.` } : undefined;
+  }
+
   async more(next: Next, _limit?: number, signal?: AbortSignal): Promise<SourcePage> {
     const n = next as GitNext;
     const page = await this.repo.page(n.req, n.exclude, signal);
+    mark(page.commits, this.unpushed);
     return { commits: page.commits, next: page.next && { req: page.next, exclude: n.exclude } };
   }
 
   async expand(merge: Commit, level: Level, limit: number, signal?: AbortSignal): Promise<SourcePage & { level: Level }> {
     const exclude = level as string[];
     const page = await this.repo.branchPage(merge, exclude, limit, signal);
+    mark(page.commits, this.unpushed);
     const childLevel = GitRepo.childExclude(merge, exclude);
     return { commits: page.commits, next: page.next && { req: page.next, exclude: childLevel }, level: childLevel };
   }
@@ -234,6 +291,23 @@ export class GitSource implements HistorySource {
     );
     for (const c of commits) c.files ??= byRev.get(c.rev) ?? [];
   }
+}
+
+/** Marks the commits the upstream doesn't have. */
+function mark(commits: Commit[], unpushed: Unpushed | undefined): void {
+  if (!unpushed) return;
+  for (const c of commits) if (unpushed.revs.has(c.rev)) c.unpushed = unpushed.note;
+}
+
+/** The row under the unpushed commits; like the incoming separator, it says how long ago the last fetch was. */
+function pushedLine(upName: string, fetched: Date | undefined): PushedLine {
+  return {
+    label: `upstream: ${upName}`,
+    description: fetched ? `fetched ${relativeTime(fetched)}` : "not fetched yet",
+    tooltip:
+      `The commits above aren't on ${upName} yet; a push sends them. The commits below are on it. ` +
+      `${upName} is as of the last fetch (${fetched ? fetched.toLocaleString() : "never"}); the Fetch button updates it.`,
+  };
 }
 
 /** The incoming separator's description and tooltip, which say how long ago the last fetch was. */

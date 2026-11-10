@@ -30,6 +30,11 @@ export interface Commit {
   files?: ChangedFile[];
   /** Set when `files` lists only some of them (svn keeps at most 100): how many the commit changed. */
   filesTotal?: number;
+  /**
+   * git: set when the commit is on the branch but not in its upstream yet (as of
+   * the last fetch); the tooltip line that says so. The mirror of an incoming commit.
+   */
+  unpushed?: string;
 }
 
 /** One file changed by a commit. Paths are repository-relative, without a leading slash. */

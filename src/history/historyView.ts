@@ -5,7 +5,7 @@ import { describeError, isCancelled } from "../errors";
 import { log } from "../log";
 import { avatarDataUri } from "./avatar";
 import { relativeTime, shortRefs } from "./format";
-import { HistorySource, Level, Next, SourcePage, TopPage } from "./source";
+import { HistorySource, Level, Next, PushedLine, SourcePage, TopPage } from "./source";
 
 export interface Target {
   file: vscode.Uri;
@@ -201,7 +201,8 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
         try {
           const page = await target.source.top(this.limit(), signal);
           if (gen !== this.generation) return [];
-          const nodes = [...this.incomingNodes(page), ...this.toNodes(page, page.level, undefined)];
+          this.pushedLine = page.pushedLine;
+          const nodes = [...this.incomingNodes(page), ...this.withPushedLine(this.toNodes(page, page.level, undefined), undefined)];
           await this.settle(nodes, target.source, signal);
           if (gen !== this.generation) return [];
           this.rootNodes = nodes;
@@ -276,6 +277,25 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     return nodes;
   }
 
+  /** git: the separator for under the unpushed commits, for the history being shown. */
+  private pushedLine?: PushedLine;
+
+  /**
+   * Top level only: puts the "upstream" separator between the unpushed commits and
+   * the first one the upstream has. `before` is the row these follow (Load more).
+   * A first-parent walk reaches the upstream's commits once and stays in them, so
+   * there is one such place; if every commit is unpushed, there is no line.
+   */
+  private withPushedLine(nodes: Node[], before: Node | undefined): Node[] {
+    const line = this.pushedLine;
+    if (!line) return nodes;
+    const unpushed = (n: Node | undefined) => n?.type === "commit" && !n.incoming && n.commit.unpushed !== undefined;
+    const i = nodes.findIndex((n, j) => n.type === "commit" && !unpushed(n) && unpushed(j > 0 ? nodes[j - 1] : before));
+    if (i < 0) return nodes;
+    const row: Node = { type: "info", key: "upstream", text: `──── ${line.label} ────`, icon: "cloud", description: line.description, tooltip: line.tooltip };
+    return [...nodes.slice(0, i), row, ...nodes.slice(i)];
+  }
+
   private toNodes(page: SourcePage, level: Level, parent: CommitNode | undefined): Node[] {
     const nodes: Node[] = page.commits.map((commit) => ({ type: "commit", commit, level, parent }));
     if (page.next) nodes.push({ type: "more", next: page.next, level, parent });
@@ -345,7 +365,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
       await this.settle(added, target.source, this.abort.signal);
       if (gen !== this.generation) return;
       const i = container.indexOf(node);
-      if (i >= 0) container.splice(i, 1, ...added);
+      if (i >= 0) container.splice(i, 1, ...(node.parent ? added : this.withPushedLine(added, container[i - 1])));
     } catch (e) {
       if (gen !== this.generation || isCancelled(e)) return;
       void vscode.window.showWarningMessage(describeError(e));
@@ -443,6 +463,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     if (c.isPullMerge) bits.unshift("pull merge");
     else if (expandsToMerged(node)) bits.unshift("merge");
     if (node.incoming) bits.unshift("incoming");
+    else if (c.unpushed) bits.unshift("unpushed");
     if (c.status?.startsWith("R") && c.oldPath) {
       const same = path.posix.basename(c.oldPath) === path.posix.basename(c.path);
       bits.push(same ? `moved from ${path.posix.dirname(c.oldPath)}/` : `renamed from ${path.posix.basename(c.oldPath)}`);
@@ -457,7 +478,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     // A bubble with the author's initial, colored per author.
     item.iconPath = vscode.Uri.parse(avatarDataUri(c.author));
     item.contextValue = c.isMerge ? "stitch.merge" : "stitch.commit";
-    item.tooltip = this.tooltip(c, node.incoming ? node.incomingNote : undefined);
+    item.tooltip = this.tooltip(c, node.incoming ? node.incomingNote : undefined, node.incoming ? undefined : c.unpushed);
     item.command = { command: "stitch.diffWithPrevious", title: "Diff with Previous", arguments: [node] };
     return item;
   }
@@ -477,9 +498,10 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     return item;
   }
 
-  private tooltip(c: Commit, incoming?: string): vscode.MarkdownString {
+  private tooltip(c: Commit, incoming?: string, unpushed?: string): vscode.MarkdownString {
     const md = new vscode.MarkdownString(undefined, true);
     if (incoming) md.appendMarkdown(`$(cloud-download) _${escapeMd(incoming)}_\n\n`);
+    if (unpushed) md.appendMarkdown(`$(cloud-upload) _${escapeMd(unpushed)}_\n\n`);
     md.appendMarkdown(`**${escapeMd(c.subject)}**\n\n`);
     if (c.body) md.appendText(c.body + "\n\n");
     const who = c.email ? `${escapeMd(c.author)} <${escapeMd(c.email)}>` : escapeMd(c.author);

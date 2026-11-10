@@ -109,6 +109,15 @@ export class GitRepo {
   }
 
   /**
+   * The commits reachable from `from` but not from `exclude` (all parents, not
+   * first-parent): with a branch and its upstream, the commits that aren't pushed.
+   */
+  async notIn(from: string, exclude: string, signal?: AbortSignal): Promise<Set<string>> {
+    const out = await this.run(["rev-list", from, `^${exclude}`, "--"], signal);
+    return new Set(out.toString("utf8").split("\n").filter(Boolean));
+  }
+
+  /**
    * Every file each commit changed, against its first parent (a root commit: all
    * added). One git call for a whole page of commits.
    */

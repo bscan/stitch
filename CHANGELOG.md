@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Unpushed** marker (Git): commits on your branch that its upstream doesn't have yet are tagged "unpushed", also on later pages and under expanded merges. A separator (`──── upstream: origin/main ────`) sits between them and the commits the upstream has. Like incoming commits, this reflects the last fetch.
 - **Revert Change** for SVN gutter diffs: click a gutter marker, then the revert button in the peek, to put that change back to BASE. It edits the editor only and doesn't save, so the file on disk is unchanged until you save, and Undo brings the change back.
 - Switching back to a Git file is instant: its history, changed files and merge counts are reused while its branch and upstream haven't moved (a commit, pull, checkout or fetch loads it again). **Refresh** always reloads.
 - Faster SVN history when opening several files in a row: the server's newest revision number is reused for 60 seconds (was 10), which saves one request per file. **Refresh** always asks again.
