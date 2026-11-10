@@ -9,7 +9,7 @@ import { parseLog, toCommits } from "../src/git/parse";
 import { fetchNote, relativeTime, shortRefs, staleFetchMs } from "../src/history/format";
 import { fetchBlockedReason, FetchPolicy, mountFor } from "../src/git/fetchPolicy";
 import { Resolver } from "../src/resolver";
-import { changedFiles, MAX_FILES, svnDisplayPath, toCommit } from "../src/svn/svnHistory";
+import { changedFiles, locate, MAX_FILES, svnDisplayPath, toCommit } from "../src/svn/svnHistory";
 import { LogItem } from "../src/svn/dav";
 import { lineSegments, revertHunk } from "../src/revertHunk";
 
@@ -146,6 +146,65 @@ describe("svn changed files", function () {
     const small = toCommit(item(paths.slice(0, 3)), "/trunk/f00001.txt").commit;
     assert.strictEqual(small.files!.length, 3);
     assert.strictEqual(small.filesTotal, undefined);
+  });
+});
+
+describe("svn path tracking through folder copies", function () {
+  const item = (paths: LogItem["paths"]): LogItem => ({ rev: 6, paths, hasChildren: false, subtractive: false, children: [] });
+  const file = "/trunk/newdir/file.c";
+
+  it("a file edited in the revision that moved its folder came from the old folder", function () {
+    const it6 = item([
+      { action: "D", path: "/trunk/dir", kind: "dir" },
+      { action: "A", path: "/trunk/newdir", kind: "dir", copyFromPath: "/trunk/dir", copyFromRev: 5 },
+      { action: "M", path: file, kind: "file", textMods: true },
+    ]);
+    assert.deepStrictEqual(locate(it6, file), { action: "M", src: { path: "/trunk/dir/file.c", rev: 5 }, renamed: true });
+    const { commit, before } = toCommit(it6, file);
+    assert.deepStrictEqual(before, { path: "/trunk/dir/file.c", rev: 5 });
+    assert.strictEqual(commit.status, "R");
+    assert.strictEqual(commit.oldPath, "trunk/dir/file.c");
+    assert.deepStrictEqual(commit.parents, ["5"]);
+    assert.deepStrictEqual(commit.files, [{ path: "trunk/newdir/file.c", status: "R", oldPath: "trunk/dir/file.c", fromRev: "5" }]);
+  });
+
+  it("a file edited in the revision that created a branch came from the branch source", function () {
+    const it6 = item([
+      { action: "A", path: "/branches/x", kind: "dir", copyFromPath: "/trunk", copyFromRev: 5 },
+      { action: "M", path: "/branches/x/file.c", kind: "file", textMods: true },
+    ]);
+    const { commit, before } = toCommit(it6, "/branches/x/file.c");
+    assert.deepStrictEqual(before, { path: "/trunk/file.c", rev: 5 });
+    assert.strictEqual(commit.status, "C");
+    assert.strictEqual(commit.oldPath, "trunk/file.c");
+    assert.deepStrictEqual(commit.files, [{ path: "branches/x/file.c", status: "C", oldPath: "trunk/file.c", fromRev: "5" }]);
+  });
+
+  it("keeps new files, unlisted copied files and plain edits as they were", function () {
+    const copy = { action: "A" as const, path: "/branches/x", kind: "dir", copyFromPath: "/trunk", copyFromRev: 5 };
+    // A new file (no copyfrom) under a copied folder has no history.
+    const added = toCommit(item([copy, { action: "A", path: "/branches/x/new.c", kind: "file" }]), "/branches/x/new.c");
+    assert.strictEqual(added.commit.status, "A");
+    assert.strictEqual(added.before, undefined);
+    assert.deepStrictEqual(added.commit.files, [{ path: "branches/x/new.c", status: "A", fromRev: "5" }]);
+    // Deleted from the new branch: still a deletion.
+    assert.deepStrictEqual(locate(item([copy, { action: "D", path: "/branches/x/old.c", kind: "file" }]), "/branches/x/old.c"), {
+      action: "D",
+      renamed: false,
+    });
+    // Not listed itself: came along with the folder.
+    const along = toCommit(item([copy]), "/branches/x/file.c");
+    assert.strictEqual(along.commit.status, "C");
+    assert.deepStrictEqual(along.before, { path: "/trunk/file.c", rev: 5 });
+    // A plain edit with no copied parent.
+    const plain = item([
+      { action: "A", path: "/branches/y", kind: "dir", copyFromPath: "/trunk", copyFromRev: 5 },
+      { action: "M", path: "/trunk/file.c", kind: "file", textMods: true },
+    ]);
+    const edit = toCommit(plain, "/trunk/file.c");
+    assert.strictEqual(edit.commit.status, "M");
+    assert.deepStrictEqual(edit.before, { path: "/trunk/file.c", rev: 5 });
+    assert.deepStrictEqual(edit.commit.files, [{ path: "trunk/file.c", status: "M", fromRev: "5" }]);
   });
 });
 

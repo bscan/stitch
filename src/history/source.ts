@@ -63,8 +63,36 @@ interface GitNext {
   exclude: string[];
 }
 
+/** What a git history depends on: the starting ref's commit and its upstream (name and commit). */
+interface GitState {
+  head: string;
+  up?: { name: string; hash: string };
+}
+
+const stateKey = (s: GitState) => `${s.head} ${s.up?.name ?? ""} ${s.up?.hash ?? ""}`;
+
+/** The incoming part of a remembered page, minus the text that depends on the time of the last fetch. */
+interface IncomingData {
+  incoming: Incoming;
+  upName: string;
+  branch: string;
+}
+
+/**
+ * Git history of one file from one starting ref. top() remembers its result for as
+ * long as the ref and its upstream stay where they were (checked with rev-parse on
+ * every top()), so switching back to a file runs no `git log`. The changed files
+ * the view fills into the commits, and merge counts, are kept with it. invalidate()
+ * (Refresh, settings, the Fetch button) forgets all of it.
+ */
 export class GitSource implements HistorySource {
   readonly vcs = "git";
+  /** The last successful top(): the state it was loaded at, for which limit, and the result. */
+  private last?: { state: string; limit: number; page: TopPage; incoming?: IncomingData };
+  /** The state the last top() saw (also when it failed), for moved(). */
+  private checkedState?: string;
+  /** Merge counts by merge, path and exclusions (immutable: they only name commits). */
+  private readonly counts = new Map<string, { p: Promise<number>; signal?: AbortSignal }>();
 
   constructor(
     readonly repo: GitRepo,
@@ -80,15 +108,62 @@ export class GitSource implements HistorySource {
     return `git:${this.ref}:${this.relPath}`;
   }
 
+  /** Where the ref and its upstream are now (rev-parse only). */
+  private async state(signal?: AbortSignal): Promise<GitState> {
+    const [head, up] = await Promise.all([
+      this.repo.resolve(this.ref, signal).catch(() => ""),
+      this.repo.upstream(this.ref, signal).catch(() => undefined),
+    ]);
+    return { head, up };
+  }
+
+  /**
+   * Whether the ref or its upstream moved since the last top() (a commit, pull,
+   * checkout or fetch). If so, the remembered history is dropped. False before any top().
+   */
+  async moved(signal?: AbortSignal): Promise<boolean> {
+    if (this.checkedState === undefined) return false;
+    const now = stateKey(await this.state(signal));
+    if (signal?.aborted || now === this.checkedState) return false;
+    this.last = undefined;
+    return true;
+  }
+
+  /** Forgets the remembered history and merge counts: the next top() queries git again. */
+  invalidate(): void {
+    this.last = undefined;
+    this.checkedState = undefined;
+    this.counts.clear();
+  }
+
   async top(limit: number, signal?: AbortSignal): Promise<TopPage> {
+    const state = await this.state(signal);
+    const key = stateKey(state);
+    if (!signal?.aborted) this.checkedState = key;
+    const last = this.last;
+    if (last && last.state === key && last.limit === limit) return this.serve(last, signal);
+    let incomingFailed = false;
     const [page, incoming] = await Promise.all([
-      this.repo.page({ from: this.ref, path: this.relPath, limit }, [], signal),
-      this.incoming(limit, signal).catch((e) => {
-        log.warn(`incoming commits for ${this.relPath}: ${(e as Error).message}`);
+      // From the resolved commit, so the result matches the state it's remembered under.
+      this.repo.page({ from: state.head || this.ref, path: this.relPath, limit }, [], signal),
+      this.incoming(limit, state, signal).catch((e) => {
+        incomingFailed = true;
+        if (!signal?.aborted) log.warn(`incoming commits for ${this.relPath}: ${(e as Error).message}`);
         return undefined; // history without the incoming part is still useful
       }),
     ]);
-    return { commits: page.commits, next: page.next && { req: page.next, exclude: [] }, level: [], incoming };
+    const result: TopPage = { commits: page.commits, next: page.next && { req: page.next, exclude: [] }, level: [], incoming: incoming?.incoming };
+    // A cancelled load isn't a result, and one without its incoming part (a failure) is tried again next time.
+    if (!signal?.aborted && !incomingFailed) this.last = { state: key, limit, page: result, incoming };
+    return result;
+  }
+
+  /** The remembered page, with the separator's fetch time as of now (one stat). */
+  private async serve(last: NonNullable<GitSource["last"]>, signal?: AbortSignal): Promise<TopPage> {
+    const inc = last.incoming;
+    if (!inc) return last.page;
+    const fetched = await this.repo.lastFetch(signal);
+    return { ...last.page, incoming: { ...inc.incoming, ...fetchText(inc.upName, inc.branch, fetched) } };
   }
 
   /**
@@ -96,24 +171,23 @@ export class GitSource implements HistorySource {
    * aren't in the branch: a first-parent walk of the upstream, excluding the branch.
    * Read-only: uses the remote-tracking branch as of the last fetch (the Fetch button, in extension.ts, is separate).
    */
-  private async incoming(limit: number, signal?: AbortSignal): Promise<Incoming | undefined> {
-    const up = await this.repo.upstream(this.ref, signal);
-    if (!up) return undefined;
-    const head = await this.repo.resolve(this.ref, signal);
+  private async incoming(limit: number, state: GitState, signal?: AbortSignal): Promise<IncomingData | undefined> {
+    const { up, head } = state;
+    if (!up || !head) return undefined;
     const page = await this.repo.page({ from: up.hash, path: this.relPath, limit }, [head], signal);
     if (page.commits.length === 0) return undefined;
     const [branch, fetched] = await Promise.all([this.repo.branchName(this.ref, signal), this.repo.lastFetch(signal)]);
-    const when = fetched ? `fetched ${relativeTime(fetched)}` : "not fetched yet";
     return {
-      commits: page.commits,
-      truncated: page.next !== undefined,
-      level: [head],
-      label: `your branch: ${branch}`,
-      description: `${up.name}, ${when}`,
-      tooltip:
-        `The commits above are on ${up.name} but not in ${branch}; a pull brings them in. ` +
-        `${up.name} is as of the last fetch (${fetched ? fetched.toLocaleString() : "never"}); the Fetch button updates it.`,
-      rowTooltip: `On ${up.name}, not in ${branch} yet.`,
+      upName: up.name,
+      branch,
+      incoming: {
+        commits: page.commits,
+        truncated: page.next !== undefined,
+        level: [head],
+        label: `your branch: ${branch}`,
+        ...fetchText(up.name, branch, fetched),
+        rowTooltip: `On ${up.name}, not in ${branch} yet.`,
+      },
     };
   }
 
@@ -130,8 +204,27 @@ export class GitSource implements HistorySource {
     return { commits: page.commits, next: page.next && { req: page.next, exclude: childLevel }, level: childLevel };
   }
 
+  /**
+   * `rev-list --count` once per merge row. A count still running for a view that was
+   * left (its signal aborted, so it will fail) isn't reused; a finished one always is.
+   */
   count(merge: Commit, level: Level, signal?: AbortSignal): Promise<number> {
-    return this.repo.branchCount(merge, level as string[], signal);
+    const exclude = level as string[];
+    const key = `${merge.rev}\0${merge.path}\0${exclude.join(" ")}`;
+    const hit = this.counts.get(key);
+    if (hit && !hit.signal?.aborted) return hit.p;
+    const p = this.repo.branchCount(merge, exclude, signal);
+    const entry: { p: Promise<number>; signal?: AbortSignal } = { p, signal };
+    this.counts.set(key, entry);
+    p.then(
+      () => {
+        entry.signal = undefined; // done: the view that asked can go away now
+      },
+      () => {
+        if (this.counts.get(key) === entry) this.counts.delete(key);
+      }
+    );
+    return p;
   }
 
   async files(commits: Commit[], signal?: AbortSignal): Promise<void> {
@@ -141,4 +234,15 @@ export class GitSource implements HistorySource {
     );
     for (const c of commits) c.files ??= byRev.get(c.rev) ?? [];
   }
+}
+
+/** The incoming separator's description and tooltip, which say how long ago the last fetch was. */
+function fetchText(upName: string, branch: string, fetched: Date | undefined): Pick<Incoming, "description" | "tooltip"> {
+  const when = fetched ? `fetched ${relativeTime(fetched)}` : "not fetched yet";
+  return {
+    description: `${upName}, ${when}`,
+    tooltip:
+      `The commits above are on ${upName} but not in ${branch}; a pull brings them in. ` +
+      `${upName} is as of the last fetch (${fetched ? fetched.toLocaleString() : "never"}); the Fetch button updates it.`,
+  };
 }

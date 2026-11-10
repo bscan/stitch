@@ -6,6 +6,8 @@ import * as path from "path";
 import { Commit, previousDiff } from "../src/backend";
 import { git, GitError } from "../src/git/exec";
 import { GitRepo } from "../src/git/gitBackend";
+import { TopPage } from "../src/history/source";
+import { setLogSink } from "../src/log";
 import { buildFixture, Fixture } from "./gitFixture";
 
 const opts = () => ({ gitPath: "git", timeoutMs: 30000 });
@@ -324,5 +326,197 @@ describe("git incoming commits (upstream not in the branch)", function () {
 
   it("leaves .git unchanged", function () {
     assert.deepStrictEqual(hashTree(path.join(dir, ".git")), gitBefore);
+  });
+});
+
+describe("git history cache (GitSource remembers top() while the ref and upstream stay put)", function () {
+  let dir: string;
+  let repo: GitRepo;
+  const revs: Record<string, string> = {};
+  let g: (...args: string[]) => string;
+
+  //   main:        c1 ─ c2
+  //   origin/main: c1 ─ c2 ─ um (merge of s1, which changed f)
+  before(async function () {
+    const { execFileSync } = await import("child_process");
+    const { writeFileSync, appendFileSync } = await import("fs");
+    dir = mkdtempSync(path.join(tmpdir(), "stitch-cache-"));
+    g = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: dir,
+        encoding: "utf8",
+        env: { ...process.env, GIT_AUTHOR_NAME: "A", GIT_AUTHOR_EMAIL: "a@x", GIT_COMMITTER_NAME: "A", GIT_COMMITTER_EMAIL: "a@x" },
+      }).trim();
+    const commit = (name: string, ...files: string[]) => {
+      for (const f of files) appendFileSync(path.join(dir, f), `${name}\n`);
+      g("add", ...files);
+      g("commit", "-q", "-m", name);
+      revs[name] = g("rev-parse", "HEAD");
+    };
+    g("init", "-q", "-b", "main");
+    writeFileSync(path.join(dir, "other.txt"), "o\n");
+    commit("c1", "f.txt", "other.txt");
+    commit("c2", "f.txt", "other.txt");
+    g("checkout", "-q", "-b", "up");
+    g("checkout", "-q", "-b", "side");
+    commit("s1", "f.txt");
+    g("checkout", "-q", "up");
+    g("merge", "-q", "--no-ff", "-m", "um", "side");
+    revs.um = g("rev-parse", "HEAD");
+    g("update-ref", "refs/remotes/origin/main", "up");
+    g("checkout", "-q", "main");
+    g("branch", "-q", "-D", "up", "side");
+    g("config", "remote.origin.url", "https://example.invalid/r.git");
+    g("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    g("config", "branch.main.remote", "origin");
+    g("config", "branch.main.merge", "refs/heads/main");
+    repo = (await GitRepo.open(dir, opts)).repo;
+  });
+
+  after(function () {
+    setLogSink(() => undefined);
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The git subcommands run while `fn` runs (every git() call logs one line, also when cancelled). */
+  async function gitDuring(fn: () => Promise<unknown>): Promise<string[]> {
+    const ran: string[] = [];
+    setLogSink((_level, m) => {
+      const sub = /^git (\S+)/.exec(m);
+      if (sub) ran.push(sub[1]);
+    });
+    try {
+      await fn();
+    } finally {
+      setLogSink(() => undefined);
+    }
+    return ran;
+  }
+  const heavy = (ran: string[]) => ran.filter((s) => s !== "rev-parse");
+  const newSource = async () => new (await import("../src/history/source")).GitSource(repo, "f.txt", "HEAD");
+
+  it("serves the second top() at an unchanged state without git log, with files and merge counts kept", async function () {
+    const source = await newSource();
+    let first!: TopPage;
+    assert.ok(heavy(await gitDuring(async () => (first = await source.top(50)))).includes("log"));
+    await source.files([...first.commits, ...first.incoming!.commits]); // what the view's settle() does
+    const um = first.incoming!.commits[0];
+    assert.strictEqual(um.subject, "um");
+    assert.strictEqual(await source.count(um, first.incoming!.level), 1);
+
+    let again!: TopPage;
+    const ran = await gitDuring(async () => {
+      again = await source.top(50);
+      assert.strictEqual(await source.count(again.incoming!.commits[0], again.incoming!.level), 1);
+    });
+    assert.deepStrictEqual(heavy(ran), [], `only rev-parse, ran: ${ran.join(", ")}`);
+    assert.deepStrictEqual(again.commits.map((c) => c.subject), ["c2", "c1"]);
+    assert.ok(again.commits.every((c) => c.files !== undefined), "changed files are still filled in");
+    assert.deepStrictEqual(again.incoming?.commits.map((c) => c.subject), ["um"]);
+    assert.strictEqual(await source.moved(), false);
+  });
+
+  it("still reuses everything after the view that loaded it was left (its signal aborted)", async function () {
+    // Like the view: every visit has its own signal, aborted when another file is shown.
+    const source = await newSource();
+    const visit1 = new AbortController();
+    const first = await source.top(50, visit1.signal);
+    await source.files([...first.commits, ...first.incoming!.commits], visit1.signal);
+    assert.strictEqual(await source.count(first.incoming!.commits[0], first.incoming!.level, visit1.signal), 1);
+    visit1.abort(); // switched to another file
+
+    const visit2 = new AbortController();
+    const ran = await gitDuring(async () => {
+      const page = await source.top(50, visit2.signal);
+      const missing = [...page.commits, ...page.incoming!.commits].filter((c) => !c.files);
+      assert.deepStrictEqual(missing, [], "changed files are still filled in");
+      assert.strictEqual(await source.count(page.incoming!.commits[0], page.incoming!.level, visit2.signal), 1);
+    });
+    assert.deepStrictEqual(heavy(ran), [], `only rev-parse, ran: ${ran.join(", ")}`);
+  });
+
+  it("doesn't reuse a merge count that was cancelled before it finished", async function () {
+    const source = await newSource();
+    const first = await source.top(50);
+    const um = first.incoming!.commits[0];
+    const left = new AbortController();
+    const pending = source.count(um, first.incoming!.level, left.signal);
+    left.abort();
+    await assert.rejects(pending);
+    let n!: number;
+    const ran = await gitDuring(async () => (n = await source.count(um, first.incoming!.level, new AbortController().signal)));
+    assert.strictEqual(n, 1);
+    assert.ok(ran.includes("rev-list"), ran.join(", "));
+  });
+
+  it("computes the separator's fetch time when the page is served, not when it was loaded", async function () {
+    const { writeFileSync } = await import("fs");
+    const source = await newSource();
+    assert.strictEqual((await source.top(50)).incoming?.description, "origin/main, not fetched yet");
+    const fetchHead = path.join(dir, ".git", "FETCH_HEAD");
+    writeFileSync(fetchHead, ""); // test-only: simulate a fetch that moved nothing
+    try {
+      let page!: TopPage;
+      assert.deepStrictEqual(heavy(await gitDuring(async () => (page = await source.top(50)))), []);
+      assert.strictEqual(page.incoming?.description, "origin/main, fetched just now");
+      assert.match(page.incoming!.tooltip, /as of the last fetch \(\d/);
+    } finally {
+      rmSync(fetchHead);
+    }
+  });
+
+  it("loads afresh when the ref or its upstream moved", async function () {
+    const source = await newSource();
+    await source.top(50);
+    g("update-ref", "refs/remotes/origin/main", revs.c2); // test-only: as if a fetch moved origin/main
+    try {
+      assert.strictEqual(await source.moved(), true);
+      let page!: TopPage;
+      assert.ok(heavy(await gitDuring(async () => (page = await source.top(50)))).includes("log"));
+      assert.strictEqual(page.incoming, undefined); // up to date now
+      assert.strictEqual(await source.moved(), false);
+    } finally {
+      g("update-ref", "refs/remotes/origin/main", revs.um);
+    }
+    // Moved back: top() notices by itself too (no moved() call needed).
+    let page!: TopPage;
+    assert.ok(heavy(await gitDuring(async () => (page = await source.top(50)))).includes("log"));
+    assert.deepStrictEqual(page.incoming?.commits.map((c) => c.subject), ["um"]);
+  });
+
+  it("queries again after invalidate() (Refresh, settings, the Fetch button)", async function () {
+    const source = await newSource();
+    const first = await source.top(50);
+    await source.count(first.incoming!.commits[0], first.incoming!.level);
+    source.invalidate();
+    const ran = await gitDuring(async () => {
+      const page = await source.top(50);
+      await source.count(page.incoming!.commits[0], page.incoming!.level);
+    });
+    assert.ok(ran.includes("log"), ran.join(", "));
+    assert.ok(ran.includes("rev-list"), ran.join(", "));
+  });
+
+  it("doesn't remember a cancelled load", async function () {
+    const source = await newSource();
+    const ac = new AbortController();
+    const p = source.top(50, ac.signal);
+    ac.abort();
+    await assert.rejects(p);
+    assert.ok(heavy(await gitDuring(() => source.top(50))).includes("log"));
+    // An already-cancelled call doesn't leave a result behind either.
+    const fresh = await newSource();
+    const done = new AbortController();
+    done.abort();
+    await assert.rejects(fresh.top(50, done.signal));
+    assert.ok(heavy(await gitDuring(() => fresh.top(50))).includes("log"));
+  });
+
+  it("a different starting ref is a different history", async function () {
+    const { GitSource } = await import("../src/history/source");
+    const head = await new GitSource(repo, "f.txt", "HEAD").top(50);
+    const up = await new GitSource(repo, "f.txt", "origin/main").top(50);
+    assert.deepStrictEqual(head.commits.map((c) => c.subject), ["c2", "c1"]);
+    assert.deepStrictEqual(up.commits.map((c) => c.subject), ["um", "c2", "c1"]);
   });
 });

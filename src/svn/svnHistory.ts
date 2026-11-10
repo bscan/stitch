@@ -24,39 +24,44 @@ interface Located {
 }
 
 /** How old a youngest-revision answer may be for the incoming list (ms). */
-export const RECENT_YOUNGEST_MS = 10_000;
+export const RECENT_YOUNGEST_MS = 60_000;
 
 const isUnder = (p: string, dir: string) => dir === "/" || p.startsWith(dir + "/");
 
 /** How `item` changed the file at `p`, and where it came from. */
 export function locate(item: LogItem, p: string): Located {
   const exact = item.paths.find((c) => c.path === p);
-  if (exact) {
-    if ((exact.action === "A" || exact.action === "R") && exact.copyFromPath && exact.copyFromRev !== undefined) {
-      const from = exact.copyFromPath;
-      return {
-        action: exact.action,
-        src: { path: from, rev: exact.copyFromRev },
-        renamed: from !== p && item.paths.some((c) => c.action === "D" && c.path === from),
-      };
-    }
-    return { action: exact.action, renamed: false };
+  if (exact && (exact.action === "A" || exact.action === "R") && exact.copyFromPath && exact.copyFromRev !== undefined) {
+    const from = exact.copyFromPath;
+    return {
+      action: exact.action,
+      src: { path: from, rev: exact.copyFromRev },
+      renamed: from !== p && item.paths.some((c) => c.action === "D" && c.path === from),
+    };
   }
+  const parent = parentAdd(item.paths, p);
+  const viaParent = (action: ChangedPath["action"]): Located =>
+    parent?.copyFromPath && parent.copyFromRev !== undefined
+      ? {
+          action,
+          src: { path: parent.copyFromPath + p.slice(parent.path.length), rev: parent.copyFromRev },
+          renamed: item.paths.some((c) => c.action === "D" && c.path === parent.copyFromPath),
+        }
+      : { action, renamed: false };
+  // Edited in the revision that copied a parent folder (folder move, branch creation):
+  // svn lists it as M at its new path, but before it was at the copy source.
+  // An exact A/R without copyfrom is a new file and D a deletion: no source.
+  if (exact) return exact.action === "M" ? viaParent("M") : { action: exact.action, renamed: false };
   // Copied or added along with a parent folder (e.g. branch creation).
-  const parent = item.paths
+  if (parent) return viaParent("A");
+  return { action: "M", renamed: false };
+}
+
+/** The nearest parent folder of `p` that `paths` added or replaced (with or without history). */
+function parentAdd(paths: ChangedPath[], p: string): ChangedPath | undefined {
+  return paths
     .filter((c) => (c.action === "A" || c.action === "R") && isUnder(p, c.path))
     .sort((a, b) => b.path.length - a.path.length)[0];
-  if (parent) {
-    if (parent.copyFromPath && parent.copyFromRev !== undefined) {
-      return {
-        action: "A",
-        src: { path: parent.copyFromPath + p.slice(parent.path.length), rev: parent.copyFromRev },
-        renamed: item.paths.some((c) => c.action === "D" && c.path === parent.copyFromPath),
-      };
-    }
-    return { action: "A", renamed: false };
-  }
-  return { action: "M", renamed: false };
 }
 
 /** A revision that set properties on the file or a parent folder may have been a merge (svn:mergeinfo). */
@@ -98,6 +103,7 @@ export const MAX_FILES = 100;
 export function changedFiles(item: LogItem, keep?: string, max = Infinity): { files: ChangedFile[]; total: number } {
   const deleted = new Set(item.paths.filter((d) => d.action === "D").map((d) => d.path));
   const moved = new Set(item.paths.filter((c) => c.copyFromPath && deleted.has(c.copyFromPath)).map((c) => c.copyFromPath!));
+  const adds = item.paths.filter((c) => c.action === "A" || c.action === "R");
   const files: ChangedFile[] = [];
   for (const c of item.paths) {
     if (c.kind === "dir") continue;
@@ -109,6 +115,18 @@ export function changedFiles(item: LogItem, keep?: string, max = Infinity): { fi
         status: moved.has(c.copyFromPath!) ? "R" : "C",
         oldPath: strip(c.copyFromPath!),
         fromRev: String(c.copyFromRev),
+      });
+      continue;
+    }
+    // Edited where a parent folder was copied to in this revision: diff against the
+    // copy source, and call it moved/copied like toCommit() does.
+    const parent = c.action === "M" ? parentAdd(adds, c.path) : undefined;
+    if (parent?.copyFromPath && parent.copyFromRev !== undefined) {
+      files.push({
+        path: strip(c.path),
+        status: moved.has(parent.copyFromPath) ? "R" : "C",
+        oldPath: strip(parent.copyFromPath + c.path.slice(parent.path.length)),
+        fromRev: String(parent.copyFromRev),
       });
     } else {
       // "R" in svn's log is "replaced": without history that's a new file.

@@ -184,11 +184,26 @@ export class GitRepo {
     return (await this.run(["rev-parse", "--abbrev-ref", "HEAD"], signal)).toString("utf8").trim();
   }
 
-  /** When the repository was last fetched (FETCH_HEAD's mtime), if ever. Read-only: one stat. */
+  /** Where FETCH_HEAD is, once found (it doesn't move for a repository). */
+  private fetchHead?: Promise<string>;
+
+  /**
+   * When the repository was last fetched (FETCH_HEAD's mtime), if ever. Read-only:
+   * one stat (plus one rev-parse the first time, to find the file).
+   */
   async lastFetch(signal?: AbortSignal): Promise<Date | undefined> {
     try {
-      const rel = (await this.run(["rev-parse", "--git-path", "FETCH_HEAD"], signal)).toString("utf8").trim();
-      return (await fs.stat(path.resolve(this.root, rel))).mtime;
+      if (!this.fetchHead) {
+        // Not tied to `signal`: other callers share it, and it's one quick rev-parse.
+        const p = this.run(["rev-parse", "--git-path", "FETCH_HEAD"]).then((out) => path.resolve(this.root, out.toString("utf8").trim()));
+        p.catch(() => {
+          if (this.fetchHead === p) this.fetchHead = undefined;
+        });
+        this.fetchHead = p;
+      }
+      const file = await this.fetchHead;
+      if (signal?.aborted) return undefined;
+      return (await fs.stat(file)).mtime;
     } catch {
       return undefined;
     }

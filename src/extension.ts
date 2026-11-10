@@ -45,11 +45,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const openByDir = new Map<string, Promise<{ repo: GitRepo; prefix: string }>>();
   const reposByRoot = new Map<string, GitRepo>();
   const refByRoot = new Map<string, string>();
-  /** Per file: "<branch hash> <upstream hash>" when its history was loaded; a change means reload. */
-  const headByFile = new Map<string, string>();
-  const gitState = async (repo: GitRepo, ref: string) => {
-    const [head, up] = await Promise.all([repo.resolve(ref).catch(() => ""), repo.upstream(ref).catch(() => undefined)]);
-    return `${head} ${up?.hash ?? ""}`;
+  /**
+   * Git history sources per file and starting ref, kept across file switches: switching
+   * back reuses the loaded history while the ref and its upstream haven't moved
+   * (GitSource.top() checks that with rev-parse), instead of running git log again.
+   */
+  const gitSources = new Map<string, GitSource>();
+  const gitSource = (file: vscode.Uri, repo: GitRepo, relPath: string, ref: string) => {
+    const key = `${file.toString()}|${repo.root}|${relPath}|${ref}`;
+    let src = gitSources.get(key);
+    if (src && src.repo !== repo) src = undefined; // the repository was opened again
+    if (src) gitSources.delete(key); // re-inserted below: most recently used last
+    src ??= new GitSource(repo, relPath, ref);
+    gitSources.set(key, src);
+    if (gitSources.size > 30) gitSources.delete(gitSources.keys().next().value as string);
+    return src;
   };
 
   const openRepo = async (dir: string) => {
@@ -157,6 +167,9 @@ export function activate(context: vscode.ExtensionContext): void {
     svnByDir.clear();
     svnByRoot.clear();
     svnSources.clear();
+    gitSources.clear();
+    // The current view may keep its source (history.reload()): make it query again too.
+    if (history.current?.source instanceof GitSource) history.current.source.invalidate();
     dav = new DavClient(timeoutMs, svnIntervalMs);
   };
 
@@ -235,7 +248,8 @@ export function activate(context: vscode.ExtensionContext): void {
     return any;
   };
 
-  const followSvn = async (file: vscode.Uri, dir: string) => {
+  /** `stale()` turns true once a newer `follow` started: from then on this call must not touch the view or context keys. */
+  const followSvn = async (file: vscode.Uri, dir: string, stale: () => boolean) => {
     let repo: SvnRepo;
     let node;
     try {
@@ -243,11 +257,13 @@ export function activate(context: vscode.ExtensionContext): void {
       quickDiff.ensure(repo.root);
       node = await repo.node(file.fsPath);
     } catch (e) {
+      if (stale()) return;
       svnCurrent = undefined;
       setSvnModified(false);
       history.showMessage(describeError(e), file);
       return;
     }
+    if (stale()) return;
     if (!node) {
       svnCurrent = undefined;
       setSvnModified(false);
@@ -292,6 +308,7 @@ export function activate(context: vscode.ExtensionContext): void {
     history.showMessage("Contacting the SVN server…", file);
     try {
       const info = await dav.options(mapping.url);
+      if (stale()) return; // the user moved on meanwhile
       if (node.uuid && info.uuid !== node.uuid) {
         log.warn(`${mapping.url} has repository UUID ${info.uuid}; the working copy at ${repo.root} has ${node.uuid}`);
         history.showMessage(
@@ -302,18 +319,26 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         return;
       }
-      if (svnCurrent?.file.toString() !== file.toString()) return; // the user moved on meanwhile
       const source = svnSource(info, repo.root, node.reposPath, node.revision, file);
       history.setTarget({ file, source, description: path.basename(file.fsPath) });
     } catch (e) {
-      if (svnCurrent?.file.toString() === file.toString()) history.showMessage(describeError(e), file);
+      if (!stale()) history.showMessage(describeError(e), file);
     }
   };
+
+  /** Counts `follow` calls: a slow lookup for a file the user already left must not overwrite the newer one's view. */
+  let followSeq = 0;
+  /** The file the last `follow` was for: what Refresh and settings changes reload, whatever editor has focus then. */
+  let lastFollowed: vscode.Uri | undefined;
 
   /** Points the history view at a file. */
   const follow = async (file: vscode.Uri) => {
     if (file.scheme !== "file") return;
+    const seq = ++followSeq;
+    const stale = () => seq !== followSeq;
+    lastFollowed = file;
     const marker = await resolver.forFile(file.fsPath);
+    if (stale()) return;
     if (!marker) {
       svnCurrent = undefined;
       setSvnModified(false);
@@ -323,13 +348,14 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     setKind(marker.kind);
     if (marker.kind === "svn") {
-      await followSvn(file, marker.dir);
+      await followSvn(file, marker.dir, stale);
       return;
     }
     svnCurrent = undefined;
     setSvnModified(false);
     try {
       const { repo, prefix } = await openRepo(path.dirname(file.fsPath));
+      if (stale()) return;
       const relPath = GitRepo.relPath(prefix, path.basename(file.fsPath));
       const ref = refByRoot.get(repo.root) ?? "HEAD";
       const cur = history.current;
@@ -338,21 +364,36 @@ export function activate(context: vscode.ExtensionContext): void {
       history.setTarget(target);
       void updateCanFetch(target);
       void updateFetchNote(target);
-      headByFile.set(file.toString(), await gitState(repo, ref));
     } catch (e) {
-      history.showMessage(describeError(e), file);
+      if (!stale()) history.showMessage(describeError(e), file);
     }
   };
 
   const gitTarget = (file: vscode.Uri, repo: GitRepo, relPath: string, ref: string): Target => {
     const name = path.basename(file.fsPath);
-    return { file, source: new GitSource(repo, relPath, ref), description: ref === "HEAD" ? name : `${name} @ ${ref}` };
+    return { file, source: gitSource(file, repo, relPath, ref), description: ref === "HEAD" ? name : `${name} @ ${ref}` };
   };
 
   const followActive = () => {
     const editor = vscode.window.activeTextEditor;
     // Keep the current history while a diff, output panel or similar has focus.
     if (editor?.document.uri.scheme === "file") void follow(editor.document.uri);
+  };
+
+  /**
+   * Follows the last followed file again. Not the active editor: after a click on a
+   * history row that's a stitch: diff, and in the Settings UI there's none at all.
+   */
+  const followLast = () => {
+    if (lastFollowed) void follow(lastFollowed);
+    else followActive();
+  };
+
+  /** After the caches were dropped: looks the file up again from scratch. */
+  const reloadFollowed = () => {
+    if (!lastFollowed) return followActive(); // nothing shown yet: keep the view's current text
+    history.showMessage("Reloading…", lastFollowed);
+    void follow(lastFollowed);
   };
 
   /** svn: reloads the history if the server has new revisions. Asks at most once per file per interval. */
@@ -370,13 +411,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const t = history.current;
     if (!t || !(t.source instanceof GitSource)) return;
     void updateFetchNote(t); // time passes, and something else may have fetched
-    const src = t.source;
-    const key = t.file.toString();
-    const state = await gitState(src.repo, src.ref);
-    if (state !== headByFile.get(key) && history.current === t) {
-      headByFile.set(key, state);
-      history.reload();
-    }
+    if ((await t.source.moved().catch(() => false)) && history.current === t) history.reload();
   };
 
   const commitArg = (node: Node | undefined): CommitNode | undefined => (node?.type === "commit" ? node : undefined);
@@ -412,12 +447,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.onDidChangeWindowState((s) => {
       if (!s.focused) return;
       // The view shows an error or a message (server was unreachable, git timed out, …): try again.
-      if (!history.current) followActive();
+      if (!history.current) followLast();
       void refreshIfMoved();
       void refreshIfServerMoved();
       void checkSvnMetadata().then((changed) => {
         void updateSvnModified();
-        if (changed && svnCurrent) followActive(); // an update may have moved BASE
+        if (changed && svnCurrent) followLast(); // an update may have moved BASE
       });
     }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
@@ -436,12 +471,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       if (!e.affectsConfiguration("stitch")) return;
       clearRepos();
-      if (svnCurrent) {
-        history.showMessage("Reloading…");
-        followActive();
-      } else {
-        history.reload();
-      }
+      // A message may be what the setting fixes (git.path, svn.urlMap): look the file up again.
+      if (svnCurrent || !history.current) reloadFollowed();
+      else history.reload();
     }),
 
     vscode.workspace.onDidGrantWorkspaceTrust(() => {
@@ -485,8 +517,8 @@ export function activate(context: vscode.ExtensionContext): void {
           5000
         );
         if (history.current === t) {
-          // Reload even if nothing moved: the separator's "fetched …" time changed.
-          headByFile.set(t.file.toString(), await gitState(src.repo, src.ref));
+          // Reload, from git, even if nothing moved: the separator's "fetched …" time changed.
+          src.invalidate();
           history.reload();
           void updateFetchNote(t);
         }
@@ -509,13 +541,10 @@ export function activate(context: vscode.ExtensionContext): void {
       clearRepos();
       const t = history.current;
       if (t && !wasSvn && t.source instanceof GitSource) {
-        const src = t.source;
-        history.reload();
-        void gitState(src.repo, src.ref).then((h) => headByFile.set(t.file.toString(), h));
+        history.reload(); // clearRepos() made its source forget what it had loaded
         void updateFetchNote(t);
       } else {
-        history.showMessage("Reloading…");
-        followActive();
+        reloadFollowed();
       }
     }),
 
@@ -692,7 +721,6 @@ export function activate(context: vscode.ExtensionContext): void {
       history.setTarget(target);
       void updateCanFetch(target);
       void updateFetchNote(target);
-      headByFile.set(t.file.toString(), await gitState(src.repo, picked.label));
     })
   );
 
