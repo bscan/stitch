@@ -2,7 +2,7 @@
   "name": "stitch",
   "displayName": "Stitch: SVN & Git File History",
   "description": "See who changed a file, when and why. Works with SVN and Git, no svn install needed.",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "bscan",
   "icon": "images/icon.png",
   "license": "MIT",

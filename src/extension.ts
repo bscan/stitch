@@ -254,6 +254,17 @@ export function activate(context: vscode.ExtensionContext): void {
       void updateSvnModified();
       if (changed && svnCurrent) followLast();
     });
+  /**
+   * svn 1.6 rewrites a folder's entries only after it installed all of that folder's
+   * changed files (about 1 s for 2000 files locally, longer on a share), so a check
+   * right at the reload can be too early. One more check after the reloads stop catches
+   * most of those; the next focus or file switch catches the rest.
+   */
+  let recheckTimer: NodeJS.Timeout | undefined;
+  const recheckSvnSoon = () => {
+    clearTimeout(recheckTimer);
+    recheckTimer = setTimeout(() => void recheckSvn(), 2000);
+  };
 
   /** `stale()` turns true once a newer `follow` started: from then on this call must not touch the view or context keys. */
   const followSvn = async (file: vscode.Uri, dir: string, stale: () => boolean) => {
@@ -444,6 +455,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     history,
     quickDiff,
+    { dispose: () => clearTimeout(recheckTimer) },
     vscode.workspace.registerFileSystemProvider(SCHEME, fsProvider, { isReadonly: true, isCaseSensitive: true }),
 
     vscode.window.onDidChangeActiveTextEditor(() => {
@@ -471,6 +483,7 @@ export function activate(context: vscode.ExtensionContext): void {
       // the new text with the old BASE: check now rather than at the next focus or file switch.
       if (!doc.isDirty && e.contentChanges.length && doc.uri.scheme === "file" && svnByRoot.size) {
         void recheckSvn();
+        recheckSvnSoon();
         return;
       }
       // Becoming dirty shows Open Changes at once; becoming clean (undo) needs a disk check.
