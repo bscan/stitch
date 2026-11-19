@@ -22,6 +22,38 @@ export interface SourcePage {
   searched?: { scanned: number; through: string };
 }
 
+/** A search step stops for "Search further" after this long, whatever the counts say (slow servers). */
+export const SEARCH_TIME_MS = 10_000;
+
+/** A search step's progress since the user last asked for more (the first load or a click). */
+export interface SearchProgress {
+  /** Rows found. */
+  found: number;
+  /** Revisions looked at. */
+  scanned: number;
+  /** When the step started (ms since the epoch). */
+  started: number;
+  /** `scanned` when the first row was found. */
+  matchedAt?: number;
+}
+
+/**
+ * Whether a search step that hasn't filled a page yet keeps going by itself. It stops at
+ * `searchCap` or after SEARCH_TIME_MS; before that it goes on while it has looked at fewer
+ * than `searchMin` revisions, has found nothing, or is within `searchAfterMatch` of its first match.
+ */
+export function searchGoesOn(
+  p: SearchProgress,
+  limits: Pick<HistorySource, "searchCap" | "searchMin" | "searchAfterMatch">,
+  now = Date.now()
+): boolean {
+  if (p.scanned >= (limits.searchCap ?? Infinity)) return false;
+  if (now - p.started >= SEARCH_TIME_MS) return false;
+  if (p.scanned < (limits.searchMin ?? 0)) return true;
+  if (limits.searchAfterMatch === undefined || p.matchedAt === undefined) return true;
+  return p.scanned - p.matchedAt < limits.searchAfterMatch;
+}
+
 export interface HistorySource {
   readonly vcs: "git" | "svn";
   /** Local root that `stitch:` URIs for this source are relative to. */
@@ -43,6 +75,14 @@ export interface HistorySource {
   readonly flat?: boolean;
   /** Client-side searches (see SourcePage.searched): how many revisions one search step may look at. */
   readonly searchCap?: number;
+  /** Client-side searches: how many revisions one search step looks at before it may stop (see searchGoesOn). */
+  readonly searchMin?: number;
+  /**
+   * Searches that always find something (lines): once a step has its first match, it looks
+   * this many revisions further, since nearby revisions often touched the same lines.
+   * Until then it runs on, up to `searchCap`.
+   */
+  readonly searchAfterMatch?: number;
   /** Filtered histories: how many commits match and how many the scope has, when that's cheap to know. */
   filterCounts?(signal?: AbortSignal): Promise<{ shown: number; total: number } | undefined>;
 }

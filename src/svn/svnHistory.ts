@@ -206,8 +206,12 @@ export interface SvnQuery {
 const SCAN_PAGE = 100;
 /** How many revisions one search step (until "Search further") may look at: author or message… */
 export const SCAN_CAP = 1000;
-/** …and lines, where each revision costs a GET. */
-export const LINES_CAP = 30;
+/** …and lines, where each revision costs a GET. A line search always finds the revision that added the lines, so this is only a safety limit… */
+export const LINES_CAP = 1000;
+/** A line search looks at least this many revisions per step (about 3 s at 14 ms a GET)… */
+export const LINES_MIN = 200;
+/** …and, past that, this many after its first match (related changes tend to be close together). */
+export const LINES_AFTER_MATCH = 20;
 /** Revisions a line search looks at per page (the view shows progress in between). */
 const LINES_STEP = 5;
 
@@ -285,6 +289,14 @@ export class SvnSource implements HistorySource {
   get searchCap(): number | undefined {
     const f = this.filters;
     return f.lines ? LINES_CAP : f.author || f.message ? SCAN_CAP : undefined;
+  }
+
+  get searchMin(): number | undefined {
+    return this.filters.lines ? LINES_MIN : undefined;
+  }
+
+  get searchAfterMatch(): number | undefined {
+    return this.filters.lines ? LINES_AFTER_MATCH : undefined;
   }
 
   /** The last top(): when, for which limit, and its result or failure. */

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.9
+
+- **SVN line history searches further by itself.** It used to stop after 30 revisions, often before finding anything, so you had to keep clicking **Search further**. Now each search looks through at least 200 revisions, keeps going until it finds a revision that changed the lines, and then looks 20 revisions past it. Matches show up while it searches. It stops early once it has traced the lines back to the revision that added them or has a full page, and any search pauses after 10 seconds on a slow server.
+- **Line history ends when you switch files.** Switching to another file clears a line history and the view follows the new file, so you don't need to press Clear after each lookup. Folder, working-copy and author/message views still stay until you clear them.
+
 ## 0.0.8
 
 - **History of a folder or a whole working copy.** Right-click a folder in the Explorer and choose **Stitch: Show History**, or pick the scope with the new **Filter** button. Clicking a commit opens all its files in that folder in one multi-diff editor. Set `stitch.history.follow` to `workingCopy` to always see the active file's whole working copy.

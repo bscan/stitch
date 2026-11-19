@@ -12,6 +12,7 @@ import { Resolver } from "../src/resolver";
 import { changedFiles, locate, MAX_FILES, svnDisplayPath, toCommit } from "../src/svn/svnHistory";
 import { LogItem } from "../src/svn/dav";
 import { lineSegments, revertHunk } from "../src/revertHunk";
+import { searchGoesOn, SEARCH_TIME_MS } from "../src/history/source";
 
 const rec = (fields: string[], changes: string[]) => "\x1e" + fields.join("\0") + "\0\0\n" + changes.join("\0") + "\0";
 
@@ -522,5 +523,31 @@ describe("revertHunk", function () {
 
   it("leaves other hunks alone", function () {
     check("a\nb\nc\nd\n", "A\nb\nC\nd\n", [3, 3, 3, 3], "A\nb\nc\nd\n");
+  });
+});
+
+describe("searchGoesOn", function () {
+  const lines = { searchCap: 1000, searchMin: 200, searchAfterMatch: 20 };
+  const at = (scanned: number, matchedAt?: number, started = 0) => ({ found: matchedAt === undefined ? 0 : 1, scanned, started, matchedAt });
+  it("searches at least searchMin revisions, even after a match", function () {
+    assert.strictEqual(searchGoesOn(at(5, 5), lines, 0), true);
+    assert.strictEqual(searchGoesOn(at(150, 5), lines, 0), true);
+    assert.strictEqual(searchGoesOn(at(200, 5), lines, 0), false);
+  });
+  it("runs on until the first match, then searchAfterMatch further", function () {
+    assert.strictEqual(searchGoesOn(at(500), lines, 0), true);
+    assert.strictEqual(searchGoesOn(at(515, 500), lines, 0), true);
+    assert.strictEqual(searchGoesOn(at(520, 500), lines, 0), false);
+    assert.strictEqual(searchGoesOn(at(205, 190), lines, 0), true); // a late match still gets its tail
+  });
+  it("stops at the cap and after SEARCH_TIME_MS, whatever else holds", function () {
+    assert.strictEqual(searchGoesOn(at(1000), lines, 0), false);
+    assert.strictEqual(searchGoesOn(at(10), lines, SEARCH_TIME_MS - 1), true);
+    assert.strictEqual(searchGoesOn(at(10), lines, SEARCH_TIME_MS), false);
+  });
+  it("author and message searches (no min or tail) run to the cap", function () {
+    const scan = { searchCap: 1000 };
+    assert.strictEqual(searchGoesOn({ found: 3, scanned: 900, started: 0, matchedAt: 100 }, scan, 0), true);
+    assert.strictEqual(searchGoesOn({ found: 3, scanned: 1000, started: 0, matchedAt: 100 }, scan, 0), false);
   });
 });

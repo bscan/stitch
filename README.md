@@ -49,13 +49,14 @@ The view normally follows the active editor. It can also show a **folder**, a wh
 - **Filter** button (view title): pick the scope (the file, each folder above it, the working copy, or another repository in the workspace) and filter by **author** or **message**. Enter widens the scope one step. The button is filled while a filter is on.
 - **Only This Author** (right-click a commit): that author's commits in the whole working copy.
 - **Clear** (✕, view title, or the first row) goes back to following the editor.
+- A **line history** also ends when you switch to another file, and the view follows that file again. Opening diffs from the history doesn't count as a switch.
 
 While the view doesn't follow the editor:
 
 - A filter shows as a warning-colored first row (`Filtered: author brian · 112 of 120 hidden`, with ✕ to clear) and as `Filtered ·` in the view title. The last row says when nothing older matches, also with ✕. A folder or working copy alone shows a plain first row with ✕.
 - When the editor's file isn't part of what's shown, a row offers **Show history of *file* instead**.
 
-**Filters** list every matching commit, branch commits included (on Git they drop the trunk view, so a matching merge doesn't expand). Author and message match any part, in any case. **Lines** are taken from the editor and mapped onto the committed file (BASE or the branch), so edits since don't throw them off; if some selected lines aren't committed yet, an **Uncommitted changes** row says so. Git follows lines with `git log -L`, through renames. SVN has no such query, so Stitch compares each revision with the one before (one download per revision) and shows its progress (`Searching… back to r1234`). It stops after 30 revisions for lines and 1000 for author or message, and **Search further** goes on.
+**Filters** list every matching commit, branch commits included (on Git they drop the trunk view, so a matching merge doesn't expand). Author and message match any part, in any case. **Lines** are taken from the editor and mapped onto the committed file (BASE or the branch), so edits since don't throw them off; if some selected lines aren't committed yet, an **Uncommitted changes** row says so. Git follows lines with `git log -L`, through renames. SVN has no such query, so Stitch compares each revision with the one before (one download per revision) and shows its progress (`Searching… back to r1234`). A line search looks through at least 200 revisions, keeps going until it finds a revision that changed the lines, then looks 20 revisions further (related edits are often close together) and stops; author and message searches stop after 1000 revisions. Any search also pauses after 10 seconds. **Search further** goes on.
 
 In a **folder or working copy**, clicking a commit opens all its files there in one multi-diff editor; expanding it lists them, plus a row for the files it changed elsewhere (click it to open the whole commit). For SVN, the incoming revisions start at the folder's own revision (a working copy can be mixed-revision).
 

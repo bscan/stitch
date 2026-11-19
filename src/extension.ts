@@ -18,6 +18,7 @@ import {
   hasFilters,
   HistorySpec,
   normalSpec,
+  releasedBy,
   sameSpec,
   Scope,
   scopeContains,
@@ -287,7 +288,8 @@ export function activate(context: vscode.ExtensionContext): void {
   // ---- what the view shows ---------------------------------------------------
   // Following (held === undefined): the editor's file, or its working copy with
   // stitch.history.follow = "workingCopy". Held: any other scope, or filters; it
-  // ignores editor switches until Clear. Held state isn't kept across a reload.
+  // ignores editor switches until Clear, except that a line filter ends when the
+  // editor switches to another file. Held state isn't kept across a reload.
   let held: HistorySpec | undefined;
   /** Held with a line filter: what the "Uncommitted changes" row opens. */
   let heldUncommitted: vscode.Command | undefined;
@@ -499,8 +501,13 @@ export function activate(context: vscode.ExtensionContext): void {
     else setSvnModified(false);
 
     if (held) {
-      updateOutside();
-      return;
+      if (!releasedBy(held, file.fsPath)) {
+        updateOutside();
+        return;
+      }
+      // Another file: a line filter ends, like Clear, and the view follows this file.
+      setHeld(undefined);
+      history.setOutside(undefined);
     }
     // From here on this sets the view: a held spec chosen meanwhile wins.
     const viewStale = nextViewStale();

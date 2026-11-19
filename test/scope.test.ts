@@ -13,6 +13,7 @@ import {
   isInside,
   matchesFilters,
   normalSpec,
+  releasedBy,
   sameSpec,
   scopeContains,
   scopeName,
@@ -180,5 +181,25 @@ describe("finding a workspace's repositories", function () {
   it("lists a repository once when folders overlap", async function () {
     const found = await findRepositories([path.join(dir, "one"), path.join(dir, "one", "sub"), dir], new Resolver());
     assert.deepStrictEqual(rel(found), ["git:one", "svn:two"]);
+  });
+});
+
+describe("releasedBy", function () {
+  const root = path.resolve("/wc");
+  const a = path.join(root, "src", "a.c");
+  const b = path.join(root, "src", "b.c");
+  const file = { kind: "file" as const, vcs: "svn" as const, root, path: a };
+  const lines = { range: { start: 3, end: 5 }, editor: { start: 3, end: 5 }, uncommitted: false };
+  it("ends a line filter when the editor switches to another file", function () {
+    assert.strictEqual(releasedBy({ scope: file, filters: { lines } }, b), true);
+    assert.strictEqual(releasedBy({ scope: file, filters: { lines, author: { text: "ann" } } }, b), true);
+  });
+  it("keeps it for the same file", function () {
+    assert.strictEqual(releasedBy({ scope: file, filters: { lines } }, a), false);
+  });
+  it("keeps other held views", function () {
+    assert.strictEqual(releasedBy({ scope: file, filters: { author: { text: "ann" } } }, b), false);
+    assert.strictEqual(releasedBy({ scope: { ...file, kind: "folder", path: path.join(root, "src") }, filters: {} }, b), false);
+    assert.strictEqual(releasedBy({ scope: { ...file, kind: "workingCopy", path: root }, filters: { message: "fix" } }, path.join(root, "x.c")), false);
   });
 });

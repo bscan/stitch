@@ -3,7 +3,8 @@
 //
 // The view is either *following* (the normal view: the active editor's file, or
 // its working copy with `stitch.history.follow: "workingCopy"`, no filters) or
-// *held* (anything else), which ignores editor switches until Clear.
+// *held* (anything else), which ignores editor switches until Clear. The exception is
+// a line filter: switching to another file ends it (see releasedBy).
 import * as path from "path";
 import { Commit } from "../backend";
 import { VcsKind } from "../resolver";
@@ -89,6 +90,15 @@ export function isInside(p: string, dir: string): boolean {
 /** Whether a file is part of what the scope shows. */
 export function scopeContains(scope: Scope, file: string): boolean {
   return scope.kind === "file" ? samePath(scope.path, file) : isInside(file, scope.path);
+}
+
+/**
+ * Whether switching the editor to `file` ends a held view: only a line filter does,
+ * and only for another file. Lines are a look at one spot of one file; other filters
+ * and scopes stay until Clear. Anything stacked on the lines goes with them.
+ */
+export function releasedBy(held: HistorySpec, file: string): boolean {
+  return !!held.filters.lines && !scopeContains(held.scope, file);
 }
 
 /**

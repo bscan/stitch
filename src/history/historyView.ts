@@ -6,7 +6,7 @@ import { log } from "../log";
 import { avatarDataUri } from "./avatar";
 import { relativeTime, shortRefs } from "./format";
 import { HistorySpec } from "./scope";
-import { HistorySource, Level, Next, PushedLine, SourcePage, TopPage } from "./source";
+import { HistorySource, Level, Next, PushedLine, searchGoesOn, SearchProgress, SourcePage, TopPage } from "./source";
 
 /** Held views (a scope other than the normal one, or filters): what the rows above and below the history say. */
 export interface Held {
@@ -27,7 +27,7 @@ export interface Target {
   source: HistorySource;
   /** Shown next to the view title (file name, and the starting ref if not HEAD). */
   description: string;
-  /** Set while the view is held (it then ignores editor switches until Clear). */
+  /** Set while the view is held (it then ignores editor switches until Clear; a line filter ends on another file). */
   held?: Held;
   /** What this shows (scope and filters). */
   spec?: HistorySpec;
@@ -378,10 +378,11 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     if (!node) {
       if (!this.rootNodes) {
         try {
+          const started = Date.now();
           const page = await target.source.top(this.pageLimit(target.source), signal);
           if (gen !== this.generation) return [];
           this.pushedLine = page.pushedLine;
-          this.search = { found: 0, scanned: 0 };
+          this.search = { found: 0, scanned: 0, started };
           const { nodes: body, cont } = this.pageNodes(page, page.level, undefined, undefined);
           const nodes = [...this.incomingNodes(page), ...body];
           await this.settle(nodes, target.source, signal);
@@ -500,8 +501,11 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     return nodes;
   }
 
-  /** Top-level searches (svn filters): rows found and revisions looked at since the user last asked for more. */
-  private search = { found: 0, scanned: 0 };
+  /**
+   * Top-level searches (svn filters): rows found and revisions looked at since the user last
+   * asked for more, when that was, and how many had been looked at when the first row was found.
+   */
+  private search: SearchProgress = { found: 0, scanned: 0, started: 0 };
 
   /**
    * A top-level page's rows and what follows them: "Load more…", a running search
@@ -516,6 +520,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     if (page.searched) {
       this.search.found += page.commits.length;
       this.search.scanned += page.searched.scanned;
+      if (this.search.found > 0) this.search.matchedAt ??= this.search.scanned;
       this.scannedAll.scanned += page.searched.scanned;
       this.scannedAll.matched += page.commits.length;
       this.updateHiddenCount();
@@ -523,7 +528,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     if (page.next) {
       const more: MoreNode = { type: "more", next: page.next, level, through: page.searched?.through ?? (before as MoreNode | undefined)?.through };
       if (page.searched && this.search.found < this.pageLimit(t.source)) {
-        more.mode = this.search.scanned < (t.source.searchCap ?? Infinity) ? "searching" : "further";
+        more.mode = searchGoesOn(this.search, t.source) ? "searching" : "further";
         if (more.mode === "searching") cont = more;
       }
       nodes.push(more);
@@ -622,7 +627,7 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
     const gen = this.generation;
     const container = node.parent ? node.parent.children : this.rootNodes;
     if (!container || !container.includes(node)) return;
-    if (!node.parent && !auto) this.search = { found: 0, scanned: 0 };
+    if (!node.parent && !auto) this.search = { found: 0, scanned: 0, started: Date.now() };
     if (!node.parent && node.mode !== "searching" && target.source.searchCap !== undefined) {
       // A search shows its progress while it runs.
       node.mode = "searching";
