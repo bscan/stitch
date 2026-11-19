@@ -254,6 +254,111 @@ describe("svn history over HTTP (mod_dav_svn in podman)", function () {
     await assert.rejects(client.get(info, 3, "trunk/b.txt"), (e: DavError) => e.kind === "notFound");
     await assert.rejects(new DavClient(() => 2000).options("http://127.0.0.1:1/svn/repo"), (e: DavError) => e.kind === "unreachable");
   });
+
+  // ---- history scopes and filters ------------------------------------------
+
+  /** Every row of a history, following Load more and search steps to the end, and the revisions searched. */
+  async function everything(source: SvnSource, limit = 50): Promise<{ commits: Commit[]; scanned: number; steps: number }> {
+    const first = await source.top(limit);
+    const commits = [...first.commits];
+    let scanned = first.searched?.scanned ?? 0;
+    let steps = 1;
+    let next = first.next;
+    while (next) {
+      const page = await source.more(next, limit);
+      commits.push(...page.commits);
+      scanned += page.searched?.scanned ?? 0;
+      steps++;
+      next = page.next;
+    }
+    return { commits, scanned, steps };
+  }
+  const revs = (cs: Commit[]) => cs.map((c) => Number(c.rev));
+
+  it("a folder's history is svn log of the folder, following it through its copy", async function () {
+    for (const [folder, file] of [["trunk", "log-trunk.xml"], ["branches/two", "log-two.xml"]]) {
+      const want = logRevs((await server!.expected(file)).toString()).map((w) => w.rev);
+      for (const limit of [3, 50]) {
+        const { commits } = await everything(new SvnSource(client, info, "/wc", folder, 25, () => 0, { folder: true }), limit);
+        assert.deepStrictEqual(revs(commits), want, `${folder}, pages of ${limit}`);
+      }
+    }
+    const two = (await everything(new SvnSource(client, info, "/wc", "branches/two", 25, () => 0, { folder: true }))).commits;
+    const r13 = two.find((c) => c.rev === "13")!;
+    assert.deepStrictEqual([r13.path, r13.oldPath], ["branches/two", "trunk"]);
+    assert.strictEqual(two.find((c) => c.rev === "10")!.path, "trunk", "older rows are at the copy source's path");
+  });
+
+  it("a folder's rows list every file they changed, and merges into it expand like svn log -g", async function () {
+    const source = new SvnSource(client, info, "/wc", "trunk", 25, () => 0, { folder: true });
+    assert.ok(source.scoped);
+    const { commits } = await everything(source);
+    const r2 = commits.find((c) => c.rev === "2")!;
+    assert.deepStrictEqual(r2.files?.map((f) => f.path), ["trunk/a.txt", "trunk/kw.txt", "trunk/latin1.txt", "trunk/other.txt", "trunk/sp ace#%.txt"]);
+    const r15 = commits.find((c) => c.rev === "15")!;
+    assert.ok(r15.isMerge);
+    const want = logRevs((await server!.expected("log-g-trunk-15.xml")).toString())[0].children;
+    assert.deepStrictEqual(revs((await source.expand(r15, undefined, 50)).commits), want);
+  });
+
+  it("a folder's incoming revisions start at the folder's own BASE, which the separator explains", async function () {
+    const page = await new SvnSource(client, info, "/wc", "trunk", 20, () => 0, { folder: true }).top(50);
+    assert.deepStrictEqual(page.incoming?.commits.map((c) => c.rev), ["25", "24", "23", "22", "21"]);
+    assert.match(page.incoming!.tooltip, /folder's own revision.*mixed-revision/);
+  });
+
+  it("filters by author or message page by page, like svn log filtered by hand", async function () {
+    const all = logRevs((await server!.expected("log-b.xml")).toString());
+    const byAlice = all.filter((w) => w.author === "alice").map((w) => w.rev);
+    const alice = await everything(new SvnSource(client, info, "/wc", "trunk/b.txt", 25, () => 0, { filters: { author: { text: "ALICE" } } }));
+    assert.deepStrictEqual(revs(alice.commits), byAlice);
+    assert.strictEqual(alice.scanned, all.length, "every revision of the file was looked at");
+    const exact = await everything(new SvnSource(client, info, "/wc", "trunk/b.txt", 25, () => 0, { filters: { author: { text: "alic", exact: true } } }));
+    assert.deepStrictEqual(exact.commits, []);
+    const edits = await everything(new SvnSource(client, info, "/wc", "trunk/b.txt", 25, () => 0, { filters: { message: "EDIT B", author: { text: "bob" } } }));
+    assert.deepStrictEqual(revs(edits.commits), all.filter((w) => /edit b/i.test(w.msg) && w.author === "bob").map((w) => w.rev));
+    // Incoming revisions are filtered too.
+    const incoming = await new SvnSource(client, info, "/wc", "trunk/b.txt", 14, () => 0, { filters: { author: { text: "alice" } } }).top(50);
+    assert.deepStrictEqual(incoming.incoming?.commits.map((c) => c.rev), ["15"]);
+  });
+
+  it("follows a line range back through the file's revisions (one GET each), across a rename", async function () {
+    const lines = (start: number, end: number) => ({ lines: { range: { start, end }, editor: { start, end }, uncommitted: false } });
+    // r10 edited line 4 and r3 line 2 (of a.txt, renamed to b.txt in r9); r2 added the file.
+    const early = await everything(new SvnSource(client, info, "/wc", "trunk/b.txt", 25, () => 0, { filters: lines(2, 4) }));
+    assert.deepStrictEqual(revs(early.commits), [10, 3, 2]);
+    // r16–r18 edited lines 21–23; nothing else did until the file was added.
+    const late = new SvnSource(client, info, "/wc", "trunk/b.txt", 25, () => 0, { filters: lines(21, 23) });
+    assert.deepStrictEqual(revs((await everything(late)).commits), [18, 17, 16, 2]);
+    const top = await late.top(50);
+    assert.strictEqual(top.incoming, undefined, "no incoming list for a line range");
+    assert.ok(top.searched && top.searched.scanned <= 5, "a step looks at a few revisions, then the view shows progress");
+    // Served again (a reload within the interval): the search can still go on from the remembered first page.
+    assert.deepStrictEqual(revs((await everything(late)).commits), [18, 17, 16, 2]);
+  });
+
+  it("follows lines that move: insertions and deletions above, edits and insertions inside", async function () {
+    const other = await client.options(`${server!.base}/svn/other`);
+    const lines = (start: number, end: number) => ({ lines: { range: { start, end }, editor: { start, end }, uncommitted: false } });
+    const text = (await server!.expected("cat-lines.txt")).toString().split("\n");
+    // In r7, "line 10" … "line 12" (with the line inserted in r6) are lines 12–15.
+    assert.deepStrictEqual(text.slice(11, 15), ["line 10", "inserted", "line 11 o3", "line 12"]);
+    const walk = (s: number, e: number) => everything(new SvnSource(client, other, "/wc", "lines.txt", 7, () => 0, { filters: lines(s, e) }));
+    assert.deepStrictEqual(revs((await walk(12, 15)).commits), [6, 3, 1]);
+    // Only the inserted line: it came in with r6, and the search ends there.
+    const inserted = await walk(13, 13);
+    assert.deepStrictEqual(revs(inserted.commits), [6]);
+    assert.strictEqual(inserted.scanned, 2, "r7 and r6, nothing older");
+    // The three lines on top came with r2.
+    assert.deepStrictEqual(revs((await walk(1, 3)).commits), [2]);
+    // Outside the range: only r4's edit and r1.
+    assert.deepStrictEqual(revs((await walk(5, 5)).commits), [4, 1]);
+    // With an author filter as well, both must match.
+    const carol = await everything(
+      new SvnSource(client, other, "/wc", "lines.txt", 7, () => 0, { filters: { ...lines(12, 15), author: { text: "carol" } } })
+    );
+    assert.deepStrictEqual(revs(carol.commits), [3]);
+  });
 });
 
 describe("svn HTTP client without a server", function () {

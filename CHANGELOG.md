@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.8
+
+- **History of a folder or a whole working copy.** Right-click a folder in the Explorer and choose **Stitch: Show History**, or pick the scope with the new **Filter** button. Clicking a commit opens all its files in that folder in one multi-diff editor. Set `stitch.history.follow` to `workingCopy` to always see the active file's whole working copy.
+- **History of lines**: right-click a line, or select several, and choose **Stitch: Show Git History** (or SVN). Git uses `git log -L`; SVN compares revisions one by one and shows how far back it has searched.
+- **Filter by author or message** (Filter button), or right-click a commit for **Only This Author**. Filters list every matching commit, branch commits included. An active filter is flagged by a warning-colored first row and "Filtered ·" in the view title.
+- **History from the Explorer**: **Stitch: Show History** on a file shows its history without opening it.
+- **Other repositories** in the workspace are listed in the Filter menu.
+- While the view shows a chosen scope or filter it stays put when you switch files; **Clear** (✕) follows the editor again.
+
 ## 0.0.7
 
 - Fixed: after `svn update`, SVN gutter markers could keep showing the changes that came in as if they were local edits, until the window was reloaded. They now clear as soon as the updated file reloads, and at the latest on the next file switch or window focus. This mostly affected updates run from VS Code's integrated terminal.

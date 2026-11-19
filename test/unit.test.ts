@@ -147,6 +147,23 @@ describe("svn changed files", function () {
     assert.strictEqual(small.files!.length, 3);
     assert.strictEqual(small.filesTotal, undefined);
   });
+
+  it("in a folder's history, keeps the folder's files first when a revision is trimmed", function () {
+    const others = Array.from({ length: 150 }, (_, i) => ({ action: "M" as const, path: `/trunk/a/f${String(i).padStart(3, "0")}.txt`, kind: "file" }));
+    const mine = [
+      { action: "M" as const, path: "/trunk/src/history/x.ts", kind: "file" },
+      { action: "A" as const, path: "/trunk/src/history/y.ts", kind: "file" },
+    ];
+    const { commit } = toCommit(item([...others, ...mine]), "/trunk/src/history", true);
+    assert.strictEqual(commit.files!.length, MAX_FILES);
+    assert.strictEqual(commit.filesTotal, 152);
+    const inside = commit.files!.filter((f) => f.path.startsWith("trunk/src/history/"));
+    assert.deepStrictEqual(inside.map((f) => f.path), ["trunk/src/history/x.ts", "trunk/src/history/y.ts"]);
+    // Still sorted by path, the others filling up to the limit.
+    assert.deepStrictEqual(commit.files!.map((f) => f.path), [...commit.files!.map((f) => f.path)].sort((a, b) => a.localeCompare(b)));
+    // A file's history is unchanged: the first files by path, plus its own.
+    assert.ok(!toCommit(item([...others, ...mine]), "/trunk/src/history/x.ts").commit.files!.some((f) => f.path.endsWith("y.ts")));
+  });
 });
 
 describe("svn path tracking through folder copies", function () {

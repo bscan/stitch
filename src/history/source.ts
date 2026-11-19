@@ -3,7 +3,7 @@
 // opaque to the view: the backend's own context for a level (git: the exclusion
 // list of the first-parent walk; svn: nothing).
 import { Commit } from "../backend";
-import { GitRepo, PageRequest } from "../git/gitBackend";
+import { GitRepo, isFlat, LogQuery, PageRequest } from "../git/gitBackend";
 import { log } from "../log";
 import { relativeTime } from "./format";
 
@@ -14,6 +14,12 @@ export interface SourcePage {
   commits: Commit[];
   /** Pass to more() for the next page of the same level; absent on the last page. */
   next?: Next;
+  /**
+   * Set by searches that go through the history on the client (svn author, message
+   * and line filters): how many revisions this page looked at, and down to where.
+   * The view keeps asking for pages until it has enough rows or reaches `searchCap`.
+   */
+  searched?: { scanned: number; through: string };
 }
 
 export interface HistorySource {
@@ -31,6 +37,14 @@ export interface HistorySource {
   count(merge: Commit, level: Level, signal?: AbortSignal): Promise<number>;
   /** Fills Commit.files for commits that don't have it yet (sources that can't list them up front). */
   files?(commits: Commit[], signal?: AbortSignal): Promise<void>;
+  /** A folder's or working copy's history: every row expands to its changed files (loaded then, on git). */
+  readonly scoped?: boolean;
+  /** A flat filtered list: merges are plain rows, since what they brought in is listed too. */
+  readonly flat?: boolean;
+  /** Client-side searches (see SourcePage.searched): how many revisions one search step may look at. */
+  readonly searchCap?: number;
+  /** Filtered histories: how many commits match and how many the scope has, when that's cheap to know. */
+  filterCounts?(signal?: AbortSignal): Promise<{ shown: number; total: number } | undefined>;
 }
 
 /**
@@ -69,6 +83,26 @@ export interface PushedLine {
 
 export type TopPage = SourcePage & { level: Level; incoming?: Incoming; pushedLine?: PushedLine };
 
+/** A history with nothing in it: a line filter whose selected lines are all uncommitted. */
+export class EmptySource implements HistorySource {
+  constructor(
+    readonly vcs: "git" | "svn",
+    readonly root: string,
+    readonly key: string
+  ) {}
+  async top(): Promise<TopPage> {
+    return { commits: [], level: undefined };
+  }
+  async more(): Promise<SourcePage> {
+    return { commits: [] };
+  }
+  async expand(): Promise<SourcePage & { level: Level }> {
+    return { commits: [], level: undefined };
+  }
+  async count(): Promise<number> {
+    return 0;
+  }
+}
 
 interface GitNext {
   req: PageRequest;
@@ -117,8 +151,10 @@ export class GitSource implements HistorySource {
 
   constructor(
     readonly repo: GitRepo,
+    /** The file's (or folder's) repository-relative path; "" for the whole repository. */
     readonly relPath: string,
-    readonly ref: string
+    readonly ref: string,
+    readonly query: LogQuery = { kind: "file" }
   ) {}
 
   get root(): string {
@@ -126,7 +162,24 @@ export class GitSource implements HistorySource {
   }
 
   get key(): string {
-    return `git:${this.ref}:${this.relPath}`;
+    const q = this.query;
+    return `git:${this.ref}:${q.kind}:${this.relPath}` + (isFlat(q) ? `:${JSON.stringify([q.author, q.message, q.lines])}` : "");
+  }
+
+  get scoped(): boolean {
+    return this.query.kind !== "file";
+  }
+
+  get flat(): boolean {
+    return isFlat(this.query);
+  }
+
+  /** Folders and the whole repository: rev-list counts what git log lists (two counts per load). */
+  async filterCounts(signal?: AbortSignal): Promise<{ shown: number; total: number } | undefined> {
+    const q = this.query;
+    if (!this.flat || q.lines || q.kind === "file") return undefined;
+    const head = await this.repo.resolve(this.ref, signal);
+    return this.repo.filterCounts(head, this.relPath, q, signal);
   }
 
   /** Where the ref and its upstream are now (rev-parse only). */
@@ -170,8 +223,9 @@ export class GitSource implements HistorySource {
     let incomingFailed = false;
     const [page, incoming, unpushed] = await Promise.all([
       // From the resolved commit, so the result matches the state it's remembered under.
-      this.repo.page({ from: state.head || this.ref, path: this.relPath, limit }, [], signal),
-      this.incoming(limit, state, signal).catch((e) => {
+      this.repo.page({ from: state.head || this.ref, path: this.relPath, limit, query: this.query }, [], signal),
+      // Incoming commits aren't filtered by lines (their line numbers differ from the branch's).
+      (this.query.lines ? Promise.resolve(undefined) : this.incoming(limit, state, signal)).catch((e) => {
         incomingFailed = true;
         if (!signal?.aborted) log.warn(`incoming commits for ${this.relPath}: ${(e as Error).message}`);
         return undefined; // history without the incoming part is still useful
@@ -216,7 +270,7 @@ export class GitSource implements HistorySource {
   private async incoming(limit: number, state: GitState, signal?: AbortSignal): Promise<IncomingData | undefined> {
     const { up, head } = state;
     if (!up || !head) return undefined;
-    const page = await this.repo.page({ from: up.hash, path: this.relPath, limit }, [head], signal);
+    const page = await this.repo.page({ from: up.hash, path: this.relPath, limit, query: this.query }, [head], signal);
     if (page.commits.length === 0) return undefined;
     const [branch, fetched] = await Promise.all([this.repo.branchName(this.ref, signal), this.repo.lastFetch(signal)]);
     return {
@@ -255,7 +309,7 @@ export class GitSource implements HistorySource {
 
   async expand(merge: Commit, level: Level, limit: number, signal?: AbortSignal): Promise<SourcePage & { level: Level }> {
     const exclude = level as string[];
-    const page = await this.repo.branchPage(merge, exclude, limit, signal);
+    const page = await this.repo.branchPage(merge, exclude, limit, signal, this.query);
     mark(page.commits, this.unpushed);
     const childLevel = GitRepo.childExclude(merge, exclude);
     return { commits: page.commits, next: page.next && { req: page.next, exclude: childLevel }, level: childLevel };
@@ -270,7 +324,7 @@ export class GitSource implements HistorySource {
     const key = `${merge.rev}\0${merge.path}\0${exclude.join(" ")}`;
     const hit = this.counts.get(key);
     if (hit && !hit.signal?.aborted) return hit.p;
-    const p = this.repo.branchCount(merge, exclude, signal);
+    const p = this.repo.branchCount(merge, exclude, signal, this.query);
     const entry: { p: Promise<number>; signal?: AbortSignal } = { p, signal };
     this.counts.set(key, entry);
     p.then(

@@ -192,8 +192,9 @@ export class Wc16 implements SvnWorkingCopy {
     return new Map();
   }
 
-  async node(relPath: string): Promise<SvnNode | undefined> {
-    const dirRel = path.posix.dirname(relPath) === "." ? "" : path.posix.dirname(relPath);
+  async node(relPath: string, kind: "file" | "dir" = "file"): Promise<SvnNode | undefined> {
+    // A folder's own record is the first one in its own entries file; a file's is in its folder's.
+    const dirRel = kind === "dir" ? relPath : path.posix.dirname(relPath) === "." ? "" : path.posix.dirname(relPath);
     const name = path.posix.basename(relPath);
     let dir: Dir;
     try {
@@ -201,8 +202,8 @@ export class Wc16 implements SvnWorkingCopy {
     } catch {
       return undefined;
     }
-    const e = dir.entries.get(name);
-    if (!e || e.kind !== "file") return undefined;
+    const e = kind === "dir" ? dir.self : dir.entries.get(name);
+    if (!e || (kind === "file" && e.kind !== "file")) return undefined;
     if (e.deleted === "deleted" || e.absent === "absent" || e.schedule === "delete") return undefined;
 
     const reposRoot = e.repos ?? dir.self.repos;
@@ -224,9 +225,9 @@ export class Wc16 implements SvnWorkingCopy {
       uuid: e.uuid ?? dir.self.uuid,
       reposPath,
       revision: revision !== undefined ? parseInt(revision, 10) : undefined,
-      md5: hasBase ? e.checksum : undefined,
-      hasBase,
-      props: await this.props(dirRel, name, e),
+      md5: hasBase && kind === "file" ? e.checksum : undefined,
+      hasBase: hasBase && kind === "file",
+      props: kind === "dir" ? new Map() : await this.props(dirRel, name, e),
       translatedSize: e.workingSize !== undefined ? parseInt(e.workingSize, 10) : undefined,
       lastModTimeUs: isoToMicros(e.textTime),
       changedRev: e.cmtRev !== undefined ? parseInt(e.cmtRev, 10) : undefined,

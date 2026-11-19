@@ -31,7 +31,8 @@ export interface SvnNode {
 export interface SvnWorkingCopy {
   readonly root: string;
   readonly format: string;
-  node(relPath: string): Promise<SvnNode | undefined>;
+  /** A versioned file (or, with kind "dir", folder; "" is the root), or undefined. Folders have no BASE text or props. */
+  node(relPath: string, kind?: "file" | "dir"): Promise<SvnNode | undefined>;
   pristine(node: SvnNode): Promise<Uint8Array>;
   /** Whether the metadata on disk changed since the previous call (the first read counts as one). Reads don't reset it. */
   changed(): Promise<boolean>;

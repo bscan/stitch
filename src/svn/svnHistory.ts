@@ -7,6 +7,8 @@
 // so every row knows the path and revision of the file before it changed.
 import * as path from "path";
 import { ChangedFile, Commit } from "../backend";
+import { decodeText, LineSpan, mapRange } from "../history/patch";
+import { Filters, matchesFilters } from "../history/scope";
 import { HistorySource, Incoming, Level, Next, SourcePage, TopPage } from "../history/source";
 import { ChangedPath, DavClient, DavError, LogItem, RepoInfo } from "./dav";
 
@@ -83,7 +85,8 @@ export function svnDisplayPath(root: string, localFile: string, reposPath: strin
   const file = strip(reposPath);
   const side = strip(sidePath);
   let base: string | undefined;
-  if (file === rel) base = "";
+  if (rel === "") base = file; // the history of the working copy's root folder
+  else if (file === rel) base = "";
   else if (file.endsWith("/" + rel)) base = file.slice(0, -rel.length - 1);
   if (base === undefined) return "/" + side;
   if (base === "") return path.join(root, side);
@@ -100,7 +103,7 @@ export const MAX_FILES = 100;
  * as R, without the deletion. Beyond `max`, only the first files are kept, and
  * `keep` (the history's own file, a repository path) always is.
  */
-export function changedFiles(item: LogItem, keep?: string, max = Infinity): { files: ChangedFile[]; total: number } {
+export function changedFiles(item: LogItem, keep?: string, max = Infinity, folder = false): { files: ChangedFile[]; total: number } {
   const deleted = new Set(item.paths.filter((d) => d.action === "D").map((d) => d.path));
   const moved = new Set(item.paths.filter((c) => c.copyFromPath && deleted.has(c.copyFromPath)).map((c) => c.copyFromPath!));
   const adds = item.paths.filter((c) => c.action === "A" || c.action === "R");
@@ -138,6 +141,13 @@ export function changedFiles(item: LogItem, keep?: string, max = Infinity): { fi
   const total = files.length;
   if (total <= max) return { files, total };
   const own = keep === undefined ? undefined : strip(keep);
+  if (folder && own !== undefined) {
+    // A folder's history: the files under the folder are kept first, then others up to `max`.
+    const under = (f: ChangedFile) => own === "" || f.path.startsWith(own + "/");
+    const inside = files.filter(under);
+    const kept = [...inside.slice(0, max), ...files.filter((f) => !under(f)).slice(0, Math.max(0, max - inside.length))];
+    return { files: kept.sort((a, b) => a.path.localeCompare(b.path)), total };
+  }
   const kept = files.slice(0, max);
   const mine = files.find((f) => f.path === own);
   if (mine && !kept.includes(mine)) {
@@ -146,7 +156,11 @@ export function changedFiles(item: LogItem, keep?: string, max = Infinity): { fi
   return { files: kept, total };
 }
 
-export function toCommit(item: LogItem, p: string): { commit: Commit; before?: At } {
+/** Revisions that changed the file's properties but not its text (no need to GET them in a line search). */
+const propsOnly = new WeakSet<Commit>();
+
+/** `folder`: `p` is a folder (a folder's history), whose own files are kept when a big revision is trimmed. */
+export function toCommit(item: LogItem, p: string, folder = false): { commit: Commit; before?: At } {
   const loc = locate(item, p);
   const added = (loc.action === "A" || loc.action === "R") && !loc.src;
   const before: At | undefined = loc.src ?? (added ? undefined : { path: p, rev: item.rev - 1 });
@@ -157,7 +171,7 @@ export function toCommit(item: LogItem, p: string): { commit: Commit; before?: A
   else if (added) status = "A";
   else if (loc.src && loc.src.path !== p) status = loc.renamed ? "R" : "C";
   else status = "M";
-  const { files, total } = changedFiles(item, p, MAX_FILES);
+  const { files, total } = changedFiles(item, p, MAX_FILES, folder);
   const commit: Commit = {
     rev: String(item.rev),
     shortRev: `r${item.rev}`,
@@ -176,7 +190,39 @@ export function toCommit(item: LogItem, p: string): { commit: Commit; before?: A
     files,
     ...(total > files.length ? { filesTotal: total } : {}),
   };
+  if (item.paths.find((c) => c.path === p)?.textMods === false) propsOnly.add(commit);
   return { commit, before: before && before.rev > 0 ? before : undefined };
+}
+
+/** What an SVN history shows besides one file's full log. */
+export interface SvnQuery {
+  /** A folder's history (also a working copy's: its root folder): rows list every file they changed. */
+  folder?: boolean;
+  /** Author and message are matched here, page by page; lines are followed revision by revision. */
+  filters?: Filters;
+}
+
+/** Revisions per log request when searching by author or message. */
+const SCAN_PAGE = 100;
+/** How many revisions one search step (until "Search further") may look at: author or message… */
+export const SCAN_CAP = 1000;
+/** …and lines, where each revision costs a GET. */
+export const LINES_CAP = 30;
+/** Revisions a line search looks at per page (the view shows progress in between). */
+const LINES_STEP = 5;
+
+/** Paging state: the next log page, or a line search in progress (kept in the source, by id). */
+interface SvnNext {
+  at?: At;
+  walk?: number;
+}
+
+/** A line search: the revisions not looked at yet, the file's text in the newest of them, and the lines. */
+interface Walk {
+  queue: Commit[];
+  at?: At;
+  text?: string;
+  range: LineSpan;
 }
 
 /**
@@ -220,8 +266,26 @@ export class SvnSource implements HistorySource {
      * Minimum time between server fetches of this file's history (ms). Within it,
      * top() returns the last result (or failure) again; Refresh makes a new source.
      */
-    private readonly minIntervalMs: () => number = () => 0
+    private readonly minIntervalMs: () => number = () => 0,
+    readonly query: SvnQuery = {}
   ) {}
+
+  /** Line searches in progress, by the id in SvnNext.walk. */
+  private readonly walks = new Map<number, Walk>();
+  private walkIds = 0;
+
+  get scoped(): boolean {
+    return !!this.query.folder;
+  }
+
+  private get filters(): Filters {
+    return this.query.filters ?? {};
+  }
+
+  get searchCap(): number | undefined {
+    const f = this.filters;
+    return f.lines ? LINES_CAP : f.author || f.message ? SCAN_CAP : undefined;
+  }
 
   /** The last top(): when, for which limit, and its result or failure. */
   private last?: { at: number; limit: number; page?: TopPage; error?: unknown };
@@ -229,7 +293,9 @@ export class SvnSource implements HistorySource {
   private checkedAt = 0;
 
   get key(): string {
-    return `svn:${this.peg}:${this.reposPath}`;
+    const f = this.filters;
+    const filtered = f.lines || f.author || f.message ? `:${JSON.stringify([f.lines?.range, f.author?.text, f.author?.exact, f.message])}` : "";
+    return `svn:${this.peg}:${this.query.folder ? "dir:" : ""}${this.reposPath}${filtered}`;
   }
 
   private async page(at: At, limit: number, signal?: AbortSignal, end = 0): Promise<SourcePage> {
@@ -239,7 +305,7 @@ export class SvnSource implements HistorySource {
     let next: At | undefined;
     for (const item of items) {
       if (cur === undefined) break;
-      const { commit, before } = toCommit(item, cur);
+      const { commit, before } = toCommit(item, cur, this.query.folder);
       commits.push(commit);
       next = before;
       cur = before?.path;
@@ -259,14 +325,21 @@ export class SvnSource implements HistorySource {
     const youngest = await this.client.youngest(this.info, signal, RECENT_YOUNGEST_MS);
     this.youngestSeen = youngest;
     if (youngest <= this.peg) return undefined;
+    const what = this.query.folder ? "folder" : "file";
     const base = {
       label: `your working copy: r${this.peg}`,
-      tooltip: `Your working copy has this file at r${this.peg} (BASE). The revisions above are on the server but not in your working copy yet; svn update brings them in.`,
+      tooltip:
+        `Your working copy has this ${what} at r${this.peg} (BASE). The revisions above are on the server but not in your working copy yet; svn update brings them in.` +
+        (this.query.folder
+          ? ` r${this.peg} is the folder's own revision: a working copy can be mixed-revision, so files in it may be at other revisions.`
+          : ""),
       rowTooltip: "On the server, not in your working copy yet.",
     };
     try {
       const page = await this.page({ path: "/" + this.reposPath, rev: youngest }, limit, signal, this.peg + 1);
-      return { ...base, commits: page.commits, truncated: page.next !== undefined };
+      const f = this.filters;
+      const commits = f.author || f.message ? page.commits.filter((c) => matchesFilters(c, f)) : page.commits;
+      return { ...base, commits, truncated: page.next !== undefined };
     } catch (e) {
       if (e instanceof DavError && e.kind === "notFound") {
         const name = path.posix.basename(this.reposPath);
@@ -290,9 +363,11 @@ export class SvnSource implements HistorySource {
       return last.page!;
     }
     try {
+      const start: At = { path: "/" + this.reposPath, rev: this.peg };
       const [page, incoming] = await Promise.all([
-        this.page({ path: "/" + this.reposPath, rev: this.peg }, limit, signal),
-        this.incoming(limit, signal),
+        this.filters.lines ? this.startWalk(start, this.filters.lines.range, signal) : this.step({ at: start }, limit, signal),
+        // Incoming revisions aren't filtered by lines (their line numbers differ from BASE's).
+        this.filters.lines ? undefined : this.incoming(limit, signal),
       ]);
       const result: TopPage = { ...page, level: undefined, incoming };
       this.last = { at: Date.now(), limit, page: result };
@@ -319,7 +394,110 @@ export class SvnSource implements HistorySource {
   }
 
   more(next: Next, limit: number, signal?: AbortSignal): Promise<SourcePage> {
-    return this.page(next as At, limit, signal);
+    return this.step(next as SvnNext, limit, signal);
+  }
+
+  /** The next page: plain, or the next stretch of an author/message search or a line search. */
+  private async step(next: SvnNext, limit: number, signal?: AbortSignal): Promise<SourcePage> {
+    if (next.walk !== undefined) return this.walkStep(next.walk, signal);
+    const at = next.at!;
+    const f = this.filters;
+    if (!f.author && !f.message) {
+      const page = await this.page(at, limit, signal);
+      return { commits: page.commits, next: page.next && { at: page.next } };
+    }
+    const page = await this.page(at, SCAN_PAGE, signal);
+    const last = page.commits[page.commits.length - 1];
+    return {
+      commits: page.commits.filter((c) => matchesFilters(c, f)),
+      next: page.next && { at: page.next },
+      searched: { scanned: page.commits.length, through: last ? `r${last.rev}` : `r${at.rev}` },
+    };
+  }
+
+  /** Starts a line search at BASE; nothing to search when no line of the range is committed. */
+  private startWalk(at: At, range: LineSpan | undefined, signal?: AbortSignal): Promise<SourcePage> {
+    if (!range) return Promise.resolve({ commits: [] });
+    return this.walkStep(this.saveWalk({ queue: [], at, range }), signal);
+  }
+
+  /**
+   * Looks at the next few revisions of a line search, newest first: each one's text
+   * against its predecessor's (one GET each), keeping the revisions that changed the
+   * lines and following the lines back. The search ends when every line was added.
+   */
+  private async walkStep(id: number, signal?: AbortSignal): Promise<SourcePage> {
+    const saved = this.walks.get(id);
+    if (!saved) throw new Error("This line search is no longer available; Refresh starts it again.");
+    // A copy: the saved state stays valid for a page that is served again (the remembered top()).
+    const w: Walk = { ...saved, queue: [...saved.queue] };
+    const kept: Commit[] = [];
+    // Author and message filters apply on top of the lines (all filters must match).
+    const keep = (c: Commit) => {
+      if (matchesFilters(c, this.filters)) kept.push(c);
+    };
+    let scanned = 0;
+    let through = "";
+    let done = false;
+    const text = async (rev: string, p: string) => decodeText(await this.client.get(this.info, Number(rev), p, {}, signal));
+    while (scanned < LINES_STEP) {
+      if (w.queue.length === 0) {
+        if (!w.at) {
+          done = true;
+          break;
+        }
+        const page = await this.page(w.at, 50, signal);
+        w.queue = page.commits;
+        w.at = page.next as At | undefined;
+        if (w.queue.length === 0) {
+          done = true;
+          break;
+        }
+      }
+      const c = w.queue[0];
+      w.text ??= await text(c.rev, c.path);
+      scanned++;
+      through = `r${c.rev}`;
+      if (w.text === undefined) {
+        done = true; // binary: lines mean nothing
+        break;
+      }
+      const before = c.parents[0];
+      if (!before || c.oldPath === undefined || c.status === "D") {
+        keep(c); // added here: every line of the range comes from this revision
+        done = true;
+        break;
+      }
+      const older = propsOnly.has(c) ? w.text : await text(before, c.oldPath);
+      if (older === undefined) {
+        keep(c); // was binary before
+        done = true;
+        break;
+      }
+      const m = mapRange(w.text, older, w.range);
+      if (m.changed) keep(c);
+      w.queue.shift();
+      w.text = older;
+      if (!m.range) {
+        done = true;
+        break;
+      }
+      w.range = m.range;
+    }
+    return { commits: kept, next: done ? undefined : { walk: this.saveWalk(w) }, searched: { scanned, through } };
+  }
+
+  private saveWalk(w: Walk): number {
+    const id = ++this.walkIds;
+    this.walks.set(id, w);
+    // Each state holds a revision's text; only recent ones can still be asked for, and the
+    // one the remembered first page continues with (top() may serve that page again).
+    const pinned = (this.last?.page?.next as SvnNext | undefined)?.walk;
+    for (const old of [...this.walks.keys()]) {
+      if (this.walks.size <= 16) break;
+      if (old !== pinned) this.walks.delete(old);
+    }
+    return id;
   }
 
   /** Merged revisions of a row: fetched for top-level rows, already known for nested ones. */
@@ -345,7 +523,7 @@ export class SvnSource implements HistorySource {
     const { items, path: target } = await this.children(merge, signal);
     const commits = items.map((item) => {
       const p = pathInMerged(item, target) ?? target;
-      const { commit } = toCommit(item, p);
+      const { commit } = toCommit(item, p, this.query.folder);
       commit.isMerge = item.hasChildren; // the server says which merged revisions were merges themselves
       if (item.subtractive) commit.body = `(reverse merge)${commit.body ? "\n\n" + commit.body : ""}`;
       // Nested merges: their merged revisions came in the same response.

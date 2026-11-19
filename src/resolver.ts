@@ -41,6 +41,14 @@ async function isGitMarker(p: string): Promise<boolean> {
   }
 }
 
+/** The marker in `dir` itself (no walking up), if any. */
+export async function markerAt(dir: string): Promise<Marker | undefined> {
+  // Check git first only to break a tie when both markers sit in the same folder.
+  if (await isGitMarker(path.join(dir, ".git"))) return { kind: "git", dir };
+  if (await exists(path.join(dir, ".svn"))) return { kind: "svn", dir };
+  return undefined;
+}
+
 export class Resolver {
   private cache = new Map<string, Promise<Marker | undefined>>();
 
@@ -65,9 +73,8 @@ export class Resolver {
   private async walk(start: string): Promise<Marker | undefined> {
     let dir = start;
     for (;;) {
-      // Check git first only to break a tie when both markers sit in the same folder.
-      if (await isGitMarker(path.join(dir, ".git"))) return { kind: "git", dir };
-      if (await exists(path.join(dir, ".svn"))) return { kind: "svn", dir };
+      const here = await markerAt(dir);
+      if (here) return here;
       const parent = path.dirname(dir);
       if (parent === dir) return undefined;
       dir = parent;

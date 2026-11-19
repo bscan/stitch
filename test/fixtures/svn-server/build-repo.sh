@@ -14,6 +14,13 @@
 #   r13 branch trunk -> branches/two   r14 two: edit b
 #   r15 merge two into trunk (merged revision: r14)
 #   r16–r25  ten edits of b (paging)
+#
+# /srv/svn/other (its own UUID) holds lines.txt, whose lines move around a known
+# range (lines 10–12 of r1), for history by line range:
+#   r1  add lines 1–20          r2  three lines on top (range moves down)
+#   r3  edit line 11 (inside)   r4  edit line 2 (outside)
+#   r5  delete line 5 (outside, range moves up)
+#   r6  insert a line after line 10 (inside)        r7  append a line (outside)
 set -eu
 export LC_ALL=C TZ=UTC
 mkdir -p /srv/svn /srv/expected /tmp/w
@@ -51,6 +58,18 @@ for i in 16 17 18 19 20 21 22 23 24 25; do
   svn update -q; sed -i "s/^line $((i + 5))\$/line $((i + 5)) r$i/" b.txt; svn commit -q -m "r$i: edit b" --username bob
 done
 
+O=file:///srv/svn/other
+svn checkout -q $O /tmp/w/other
+cd /tmp/w/other
+seq 1 20 | sed 's/^/line /' > lines.txt
+svn add -q lines.txt; svn commit -q -m 'o1: add lines' --username alice
+{ printf 'top 1\ntop 2\ntop 3\n'; cat lines.txt; } > t; mv t lines.txt; svn commit -q -m 'o2: three lines on top' --username bob
+sed -i 's/^line 11$/line 11 o3/' lines.txt; svn commit -q -m 'o3: edit line 11' --username carol
+sed -i 's/^line 2$/line 2 o4/' lines.txt; svn commit -q -m 'o4: edit line 2' --username bob
+sed -i '/^line 5$/d' lines.txt; svn commit -q -m 'o5: drop line 5' --username bob
+awk '{ print } $0 == "line 10" { print "inserted" }' lines.txt > t; mv t lines.txt; svn commit -q -m 'o6: insert after line 10' --username dave
+echo tail >> lines.txt; svn commit -q -m 'o7: append' --username bob
+
 E=/srv/expected
 svnlook uuid /srv/svn/repo > $E/uuid.txt
 svnlook uuid /srv/svn/other > $E/other-uuid.txt
@@ -59,6 +78,11 @@ svn log --xml -v -g -r 8 $R/trunk/b.txt > $E/log-g-8.xml
 svn log --xml -v -g -r 15 $R/trunk/b.txt > $E/log-g-15.xml
 svn log --xml -v -g -r 12 $R/trunk/b.txt > $E/log-g-12.xml 2>/dev/null || true
 svn log --xml -v "$R/trunk/sp%20ace%23%25.txt" > $E/log-space.xml
+# Folder histories: trunk itself, a branch (followed back through its copy from trunk), a merge into trunk.
+svn log --xml -v $R/trunk > $E/log-trunk.xml
+svn log --xml -v $R/branches/two > $E/log-two.xml
+svn log --xml -v -g -r 15 $R/trunk > $E/log-g-trunk-15.xml
+svn cat $O/lines.txt > $E/cat-lines.txt
 # The file under test at a few revisions (its path: trunk/a.txt up to r8, trunk/b.txt from r9).
 for r in 2 3 5 8; do svn cat "$R/trunk/a.txt@$r" > $E/cat-b-$r.txt; done
 for r in 9 25; do svn cat "$R/trunk/b.txt@$r" > $E/cat-b-$r.txt; done

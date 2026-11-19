@@ -103,7 +103,7 @@ describe("read-only guarantee", function () {
     for (const key of Object.keys(props)) {
       if (!machine.includes(key)) {
         assert.ok(
-          ["stitch.logLimit", "stitch.timeoutMs", "stitch.svn.refreshInterval"].includes(key),
+          ["stitch.logLimit", "stitch.timeoutMs", "stitch.svn.refreshInterval", "stitch.history.follow"].includes(key),
           `review ${key} for untrusted workspaces, then list it here`
         );
       }
@@ -118,18 +118,27 @@ describe("read-only guarantee", function () {
     const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
     const commands = (pkg.contributes.commands as { command: string }[]).map((c) => c.command).sort();
     assert.deepStrictEqual(commands, [
+      "stitch.clear",
       "stitch.copyDiff",
       "stitch.copyRevision",
       "stitch.diffFile",
       "stitch.diffWithPrevious",
       "stitch.diffWithWorking",
       "stitch.fetch", // the one write: see the next test
+      "stitch.filter",
+      "stitch.filterActive",
       "stitch.loadMore",
+      "stitch.onlyAuthor",
       "stitch.openChanges",
+      "stitch.openCommit",
       "stitch.openRevision",
       "stitch.pickRef",
       "stitch.refresh",
       "stitch.revertChange", // edits the editor buffer only: see the next test
+      "stitch.searchFurther",
+      "stitch.showGitHistory",
+      "stitch.showHistory",
+      "stitch.showSvnHistory",
     ]);
   });
 

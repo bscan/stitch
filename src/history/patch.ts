@@ -284,3 +284,69 @@ export function formatDiff(input: DiffInput): string {
     ? `${gitHeader(commit, tzOffset)}\n${gitPatch(left, right)}`
     : `${svnHeader(commit, tzOffset)}\n${svnPatch(left, right)}`;
 }
+
+/** 1-based, inclusive line numbers. */
+export interface LineSpan {
+  start: number;
+  end: number;
+}
+
+/** A text's lines without their line endings (LF or CRLF); a final line break doesn't start another line. */
+export function textLines(text: string): string[] {
+  if (text === "") return [];
+  const lines = text.split(/\r?\n/);
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/**
+ * Follows a range of lines from `newer` back to `older` (two versions of a file),
+ * for history by line range. `changed`: the range differs between the two, because
+ * a line in it is new or edited in `newer`, or lines between two of its lines were
+ * removed. `range`: the same lines in `older`, including the old text of edited
+ * lines and lines removed from between them; absent when every line of the range
+ * is new in `newer`. Line endings are ignored, so an editor's CRLF text maps onto an LF BASE.
+ */
+export function mapRange(newer: string, older: string, r: LineSpan): { range?: LineSpan; changed: boolean } {
+  const a = textLines(newer);
+  const b = textLines(older);
+  const start = Math.max(1, r.start);
+  const end = Math.min(a.length, r.end);
+  if (start > end) return { changed: false };
+  const ops = editScript(a, b);
+  let ai = 0; // lines of `newer` passed
+  let bi = 0; // lines of `older` passed
+  let changed = false;
+  let lo: number | undefined;
+  let hi: number | undefined;
+  const take = (from: number, to: number) => {
+    lo ??= from;
+    hi = to;
+  };
+  for (let i = 0; i < ops.length && ai < end; ) {
+    if (ops[i] === "=") {
+      ai++;
+      bi++;
+      i++;
+      if (ai >= start) take(bi, bi);
+      continue;
+    }
+    // A hunk: newer's lines a0+1 … a0+minus replace older's b0+1 … b0+plus.
+    const a0 = ai;
+    const b0 = bi;
+    let minus = 0;
+    let plus = 0;
+    for (; i < ops.length && ops[i] !== "="; i++) {
+      if (ops[i] === "-") minus++;
+      else plus++;
+    }
+    ai += minus;
+    bi += plus;
+    // Lines of the range are new or edited; or (lines only removed) the removal sits between two of its lines.
+    const touches = minus > 0 ? a0 + 1 <= end && a0 + minus >= start : a0 >= start && a0 < end;
+    if (!touches) continue;
+    changed = true;
+    if (plus > 0) take(b0 + 1, b0 + plus);
+  }
+  return { range: lo !== undefined && hi !== undefined ? { start: lo, end: hi } : undefined, changed };
+}

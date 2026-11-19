@@ -99,6 +99,11 @@ export class SvnRepo {
     return this.wc.node(this.relPath(file));
   }
 
+  /** The node for a folder in the working copy (its root included), or undefined if svn doesn't track it. */
+  dirNode(dir: string): Promise<SvnNode | undefined> {
+    return this.wc.node(this.relPath(dir), "dir");
+  }
+
   /** BASE text as the working file would show it: keywords expanded like the client does. */
   async original(node: SvnNode): Promise<Uint8Array> {
     const raw = await this.wc.pristine(node);

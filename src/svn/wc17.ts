@@ -132,7 +132,7 @@ export class Wc17 implements SvnWorkingCopy {
     }
   }
 
-  async node(relPath: string): Promise<SvnNode | undefined> {
+  async node(relPath: string, kind: "file" | "dir" = "file"): Promise<SvnNode | undefined> {
     const { version, reposUuid, queued, rows } = await this.query(relPath);
     if (!FORMATS.includes(version)) {
       throw new SvnError(
@@ -151,7 +151,7 @@ export class Wc17 implements SvnWorkingCopy {
       log.warn(`${this.root}: an svn operation was interrupted (${queued} pending work items); svn cleanup will finish it`);
     }
     const top = rows[0];
-    if (!top || top.kind !== "file") return undefined;
+    if (!top || top.kind !== kind) return undefined;
     if (top.presence !== "normal" && top.presence !== "incomplete") {
       // base-deleted / not-present / excluded / server-excluded: not a versioned file here.
       return undefined;

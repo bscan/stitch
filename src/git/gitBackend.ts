@@ -13,12 +13,48 @@ import { ChangedFile, Commit } from "../backend";
 import { git, GitOptions } from "./exec";
 import { LOG_FORMAT, parseLog, toCommits } from "./parse";
 
+/**
+ * What a history lists. Without filters, every level is a first-parent walk (the
+ * trunk view). With author, message or line filters it is a flat list of every
+ * matching commit, branch commits included (`isFlat`), paged with --skip.
+ */
+export interface LogQuery {
+  /** "file": one file, following renames; "dir": a folder; "all": the whole repository. */
+  kind: "file" | "dir" | "all";
+  /** A case-insensitive substring of "Name <email>"; "<email>" matches one address exactly. */
+  author?: string;
+  /** A case-insensitive substring of the message. */
+  message?: string;
+  /** Commits that changed these lines (1-based, as numbered at the starting commit): `-L`, file only. */
+  lines?: { start: number; end: number };
+}
+
+export const isFlat = (q: LogQuery | undefined): boolean => !!q && !!(q.author || q.message || q.lines);
+
 export interface PageRequest {
   /** Revision to start from (a ref name or hash). */
   from: string;
-  /** Path of the file at `from`, relative to the repo root. */
+  /** Path of the file (or folder) at `from`, relative to the repo root; "" for the whole repository. */
   path: string;
   limit: number;
+  /** Default: one file's trunk history. */
+  query?: LogQuery;
+  /** Flat lists: how many matching commits earlier pages had. */
+  skip?: number;
+}
+
+/** The limiting options for a query (author and message as fixed strings, any case). */
+function filterArgs(q: LogQuery): string[] {
+  const args: string[] = [];
+  if (q.author || q.message) args.push("--fixed-strings", "--regexp-ignore-case");
+  if (q.author) args.push(`--author=${q.author}`);
+  if (q.message) args.push(`--grep=${q.message}`);
+  return args;
+}
+
+/** The pathspec after "--" (none for the whole repository, or with -L, which takes its own path). */
+function pathArgs(q: LogQuery, p: string): string[] {
+  return q.kind === "all" || q.lines ? [] : [p];
 }
 
 export interface Page {
@@ -50,31 +86,49 @@ export class GitRepo {
     return git(this.opts(), this.root, args, signal);
   }
 
-  /** One page of a first-parent walk starting at `req.from`, excluding commits reachable from `exclude`. */
+  /**
+   * One page starting at `req.from`, excluding commits reachable from `exclude`: a
+   * first-parent walk, or with filters a flat list (see LogQuery).
+   */
   async page(req: PageRequest, exclude: string[] = [], signal?: AbortSignal): Promise<Page> {
-    const out = await this.run(
-      [
-        "log",
-        "--first-parent",
-        "--follow",
-        "--name-status",
-        "-z",
-        `--format=${LOG_FORMAT}`,
-        `-n${req.limit}`,
-        req.from,
-        ...exclude.map((e) => `^${e}`),
-        "--",
-        req.path,
-      ],
-      signal
-    );
-    const commits = toCommits(parseLog(out), req.path);
+    const q = req.query ?? { kind: "file" };
+    const flat = isFlat(q);
+    const args = ["log"];
+    if (!flat) args.push("--first-parent");
+    // -L follows renames by itself (and can't be combined with --follow or a pathspec).
+    if (q.kind === "file" && !q.lines) args.push("--follow");
+    args.push(...filterArgs(q));
+    if (q.lines) args.push(`-L${q.lines.start},${q.lines.end}:${req.path}`);
+    // A folder's or repository's changed files are listed when a commit is expanded (changedFiles).
+    if (q.kind === "file") args.push("--name-status");
+    args.push("-z", `--format=${LOG_FORMAT}`, `-n${req.limit}`);
+    if (req.skip) args.push(`--skip=${req.skip}`);
+    args.push(req.from, ...exclude.map((e) => `^${e}`), "--", ...pathArgs(q, req.path));
+    const commits = toCommits(parseLog(await this.run(args, signal)), req.path);
     const last = commits[commits.length - 1];
     let next: PageRequest | undefined;
-    if (commits.length === req.limit && last.parents.length > 0 && last.oldPath !== undefined) {
-      next = { from: last.parents[0], path: last.oldPath, limit: req.limit };
+    if (commits.length === req.limit) {
+      if (flat) {
+        // Another branch's commits can follow the last row, so continue the same walk.
+        next = { ...req, skip: (req.skip ?? 0) + req.limit };
+      } else if (last.parents.length > 0 && (q.kind !== "file" || last.oldPath !== undefined)) {
+        // From the last row's first parent, with the file's path there (renames).
+        next = { from: last.parents[0], path: q.kind === "file" ? last.oldPath! : req.path, limit: req.limit, query: req.query };
+      }
     }
     return { commits, next };
+  }
+
+  /**
+   * How many commits a flat query lists, and how many the same walk without its
+   * filters would: for "112 of 120 hidden". Only for folders and the whole repository,
+   * where rev-list walks exactly what git log does (it can't follow a file's renames).
+   */
+  async filterCounts(from: string, path: string, q: LogQuery, signal?: AbortSignal): Promise<{ shown: number; total: number }> {
+    const count = async (filters: string[]) =>
+      Number((await this.run(["rev-list", "--count", ...filters, from, "--", ...pathArgs(q, path)], signal)).toString("utf8").trim()) || 0;
+    const [shown, total] = await Promise.all([count(filterArgs(q)), count([])]);
+    return { shown, total };
   }
 
   /** The exclusions for the children of `merge`, given the exclusions of the level it is on. */
@@ -83,16 +137,16 @@ export class GitRepo {
   }
 
   /** First page of what `merge` brought in. `exclude` is the exclusion list of the level `merge` is on. */
-  branchPage(merge: Commit, exclude: string[], limit: number, signal?: AbortSignal): Promise<Page> {
+  branchPage(merge: Commit, exclude: string[], limit: number, signal?: AbortSignal, query?: LogQuery): Promise<Page> {
     return this.page(
-      { from: merge.parents[1], path: merge.path, limit },
+      { from: merge.parents[1], path: merge.path, limit, query },
       GitRepo.childExclude(merge, exclude),
       signal
     );
   }
 
-  /** Number of first-parent commits on the merged branch that changed the file. */
-  async branchCount(merge: Commit, exclude: string[], signal?: AbortSignal): Promise<number> {
+  /** Number of first-parent commits on the merged branch that changed the file (or folder). */
+  async branchCount(merge: Commit, exclude: string[], signal?: AbortSignal, query?: LogQuery): Promise<number> {
     const out = await this.run(
       [
         "rev-list",
@@ -101,7 +155,7 @@ export class GitRepo {
         merge.parents[1],
         ...GitRepo.childExclude(merge, exclude).map((e) => `^${e}`),
         "--",
-        merge.path,
+        ...pathArgs(query ?? { kind: "file" }, merge.path),
       ],
       signal
     );

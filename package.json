@@ -2,7 +2,7 @@
   "name": "stitch",
   "displayName": "Stitch: SVN & Git File History",
   "description": "See who changed a file, when and why. Works with SVN and Git, no svn install needed.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "bscan",
   "icon": "images/icon.png",
   "license": "MIT",
@@ -109,24 +109,88 @@
         "command": "stitch.copyDiff",
         "title": "Copy Diff",
         "category": "Stitch"
+      },
+      {
+        "command": "stitch.showHistory",
+        "title": "Stitch: Show History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "stitch.showGitHistory",
+        "title": "Stitch: Show Git History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "stitch.showSvnHistory",
+        "title": "Stitch: Show SVN History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "stitch.filter",
+        "title": "Scope and Filters…",
+        "category": "Stitch",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "stitch.filterActive",
+        "title": "Scope and Filters… (filtered)",
+        "category": "Stitch",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "stitch.clear",
+        "title": "Clear Scope and Filters",
+        "category": "Stitch",
+        "icon": "$(close)"
+      },
+      {
+        "command": "stitch.onlyAuthor",
+        "title": "Only This Author",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.openCommit",
+        "title": "Open Changes",
+        "category": "Stitch"
+      },
+      {
+        "command": "stitch.searchFurther",
+        "title": "Search Further",
+        "category": "Stitch",
+        "icon": "$(search)"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "stitch.filter",
+          "when": "view == stitch.history && !stitch.filtered",
+          "group": "navigation@0"
+        },
+        {
+          "command": "stitch.filterActive",
+          "when": "view == stitch.history && stitch.filtered",
+          "group": "navigation@0"
+        },
+        {
+          "command": "stitch.clear",
+          "when": "view == stitch.history && stitch.held",
+          "group": "navigation@1"
+        },
+        {
           "command": "stitch.pickRef",
           "when": "view == stitch.history && stitch.kind == git",
-          "group": "navigation@1"
+          "group": "navigation@2"
         },
         {
           "command": "stitch.fetch",
           "when": "view == stitch.history && stitch.kind == git && stitch.canFetch && isWorkspaceTrusted",
-          "group": "navigation@2"
+          "group": "navigation@3"
         },
         {
           "command": "stitch.refresh",
           "when": "view == stitch.history",
-          "group": "navigation@3"
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -147,13 +211,28 @@
         },
         {
           "command": "stitch.copyRevision",
-          "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge)/",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(scoped\\.)?(commit|merge)$/",
           "group": "3_copy@1"
         },
         {
           "command": "stitch.copyDiff",
           "when": "view == stitch.history && viewItem =~ /^stitch\\.(commit|merge|file)$/",
           "group": "3_copy@2"
+        },
+        {
+          "command": "stitch.onlyAuthor",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(scoped\\.)?(commit|merge)$/",
+          "group": "4_filter@1"
+        },
+        {
+          "command": "stitch.searchFurther",
+          "when": "view == stitch.history && viewItem == stitch.further",
+          "group": "inline@1"
+        },
+        {
+          "command": "stitch.clear",
+          "when": "view == stitch.history && viewItem =~ /^stitch\\.(clearable|further)$/",
+          "group": "inline@2"
         }
       ],
       "commandPalette": [
@@ -196,6 +275,34 @@
         {
           "command": "stitch.fetch",
           "when": "stitch.canFetch && isWorkspaceTrusted"
+        },
+        {
+          "command": "stitch.filterActive",
+          "when": "false"
+        },
+        {
+          "command": "stitch.clear",
+          "when": "stitch.held"
+        },
+        {
+          "command": "stitch.onlyAuthor",
+          "when": "false"
+        },
+        {
+          "command": "stitch.openCommit",
+          "when": "false"
+        },
+        {
+          "command": "stitch.searchFurther",
+          "when": "false"
+        },
+        {
+          "command": "stitch.showGitHistory",
+          "when": "false"
+        },
+        {
+          "command": "stitch.showSvnHistory",
+          "when": "false"
         }
       ],
       "editor/title": [
@@ -209,6 +316,30 @@
         {
           "command": "stitch.revertChange",
           "when": "originalResourceScheme == stitch"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "stitch.showGitHistory",
+          "when": "resourceScheme == file && stitch.editorKind == git",
+          "group": "navigation@100"
+        },
+        {
+          "command": "stitch.showSvnHistory",
+          "when": "resourceScheme == file && stitch.editorKind == svn",
+          "group": "navigation@100"
+        },
+        {
+          "command": "stitch.showHistory",
+          "when": "resourceScheme == file && !stitch.editorKind",
+          "group": "navigation@100"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "stitch.showHistory",
+          "when": "resourceScheme == file",
+          "group": "navigation@100"
         }
       ]
     },
@@ -273,6 +404,19 @@
           ],
           "scope": "machine",
           "markdownDescription": "Windows: the drives that are local disks. The **Fetch** button is only offered for repositories on these drives (never on UNC paths like `\\\\server\\share`)."
+        },
+        "stitch.history.follow": {
+          "type": "string",
+          "enum": [
+            "file",
+            "workingCopy"
+          ],
+          "default": "file",
+          "enumDescriptions": [
+            "The history of the file in the active editor.",
+            "The whole history of the active file's working copy (git repository or SVN checkout)."
+          ],
+          "markdownDescription": "What **Stitch History** shows while it follows the editor (no scope or filter chosen): the active file's history, or the full log of its working copy."
         }
       }
     }
