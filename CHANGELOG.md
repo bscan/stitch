@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.11
+
+- **Clearer row when a search pauses.** It used to say "No older revisions changed these lines back to r18", which read like the end. It now says **Search further back…** with "searched back to r18" beside it; the end of a search still says there's nothing older.
+
 ## 0.0.10
 
 - **SVN line history is much faster on large files and slow servers.** It now fetches revisions the way `svn blame` does: one request per 50 revisions, each sent as a delta from the one before, instead of downloading the whole file once per revision. If the server can't, or the request fails, Stitch goes back to the old way for that repository until you refresh.

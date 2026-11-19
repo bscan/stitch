@@ -787,12 +787,12 @@ export class HistoryView implements vscode.TreeDataProvider<Node>, vscode.Dispos
       return item;
     }
     if (node.mode === "further") {
-      const end = this.target?.held?.endText ?? "No more matching revisions";
-      const item = new vscode.TreeItem(`${end}${node.through ? ` back to ${node.through}` : ""}`, vscode.TreeItemCollapsibleState.None);
+      // Not the end (that row says "No older revisions …"): a pause, so the label is the action.
+      const item = new vscode.TreeItem("Search further back…", vscode.TreeItemCollapsibleState.None);
       item.iconPath = new vscode.ThemeIcon("search");
-      item.description = "Search further · Clear filters";
+      item.description = node.through ? `searched back to ${node.through}` : undefined;
       item.tooltip =
-        "The search stopped here, so it doesn't run on through a long history by itself. " +
+        `The search paused${node.through ? ` at ${node.through}` : ""}, so it doesn't run on through a long history by itself. ` +
         "Click (or the search button) to look further back; ✕ clears the filters.";
       item.command = { command: "stitch.loadMore", title: "Search Further", arguments: [node] };
       item.contextValue = "stitch.further";
