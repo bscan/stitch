@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.10
+
+- **SVN line history is much faster on large files and slow servers.** It now fetches revisions the way `svn blame` does: one request per 50 revisions, each sent as a delta from the one before, instead of downloading the whole file once per revision. If the server can't, or the request fails, Stitch goes back to the old way for that repository until you refresh.
+
 ## 0.0.9
 
 - **SVN line history searches further by itself.** It used to stop after 30 revisions, often before finding anything, so you had to keep clicking **Search further**. Now each search looks through at least 200 revisions, keeps going until it finds a revision that changed the lines, and then looks 20 revisions past it. Matches show up while it searches. It stops early once it has traced the lines back to the revision that added them or has a full page, and any search pauses after 10 seconds on a slow server.

@@ -13,6 +13,10 @@ import { changedFiles, locate, MAX_FILES, svnDisplayPath, toCommit } from "../sr
 import { LogItem } from "../src/svn/dav";
 import { lineSegments, revertHunk } from "../src/revertHunk";
 import { searchGoesOn, SEARCH_TIME_MS } from "../src/history/source";
+import * as zlib from "zlib";
+import { parseFileRevs, textsOf } from "../src/svn/dav";
+import { applySvndiff, MAX_TEXT, SvndiffError } from "../src/svn/svndiff";
+import { PageTexts } from "../src/svn/svnHistory";
 
 const rec = (fields: string[], changes: string[]) => "\x1e" + fields.join("\0") + "\0\0\n" + changes.join("\0") + "\0";
 
@@ -549,5 +553,127 @@ describe("searchGoesOn", function () {
     const scan = { searchCap: 1000 };
     assert.strictEqual(searchGoesOn({ found: 3, scanned: 900, started: 0, matchedAt: 100 }, scan, 0), true);
     assert.strictEqual(searchGoesOn({ found: 3, scanned: 1000, started: 0, matchedAt: 100 }, scan, 0), false);
+  });
+});
+
+describe("svndiff", function () {
+  /** svndiff integer: 7 bits per byte, most significant first. */
+  const int = (n: number): number[] => {
+    const out = [n & 0x7f];
+    for (n = Math.floor(n / 128); n > 0; n = Math.floor(n / 128)) out.unshift((n & 0x7f) | 0x80);
+    return out;
+  };
+  /** One instruction: op 0 = from source, 1 = from target, 2 = new data. */
+  const op = (code: number, len: number, off?: number) => [
+    ...(len < 64 ? [(code << 6) | len] : [code << 6, ...int(len)]),
+    ...(off === undefined ? [] : int(off)),
+  ];
+  const window = (sOff: number, sLen: number, tLen: number, ins: number[], data: string, version = 0) => {
+    const pack = (b: Buffer) => (version === 0 ? b : Buffer.concat([Buffer.from(int(b.length)), zlib.deflateSync(b)]));
+    const i = pack(Buffer.from(ins));
+    const d = pack(Buffer.from(data));
+    return Buffer.concat([Buffer.from([...int(sOff), ...int(sLen), ...int(tLen), ...int(i.length), ...int(d.length)]), i, d]);
+  };
+  const delta = (version: number, ...windows: Buffer[]) => Buffer.concat([Buffer.from(`SVN${String.fromCharCode(version)}`, "latin1"), ...windows]);
+
+  it("copies from the source view, the target so far (overlapping) and new data", function () {
+    const src = Buffer.from("0123456789");
+    // "34" from the source, "ab" new, then 6 bytes from target offset 2 (repeats "ab").
+    const d = delta(0, window(3, 4, 10, [...op(0, 2, 0), ...op(2, 2), ...op(1, 6, 2)], "ab"));
+    assert.strictEqual(applySvndiff(src, d).toString(), "34abababab");
+  });
+  it("joins several windows, with long lengths", function () {
+    const long = "x".repeat(200);
+    const d = delta(0, window(0, 0, 200, op(2, 200), long), window(0, 10, 3, op(0, 3, 7), ""));
+    assert.strictEqual(applySvndiff(Buffer.from("0123456789"), d).toString(), long + "789");
+  });
+  it("reads zlib sections (version 1)", function () {
+    const text = "line\n".repeat(100);
+    assert.strictEqual(applySvndiff(Buffer.alloc(0), delta(1, window(0, 0, text.length, op(2, text.length), text, 1))).toString(), text);
+  });
+  it("a header without windows is an empty text (a file emptied); unchanged texts have no delta at all", function () {
+    assert.strictEqual(applySvndiff(Buffer.from("was here"), delta(0)).length, 0);
+  });
+  it("rejects what it can't read", function () {
+    assert.throws(() => applySvndiff(Buffer.alloc(0), Buffer.from("XYZ\0")), SvndiffError);
+    assert.throws(() => applySvndiff(Buffer.alloc(0), delta(2, window(0, 0, 1, op(2, 1), "a"))), /version 2/);
+    assert.throws(() => applySvndiff(Buffer.from("ab"), delta(0, window(0, 5, 1, op(0, 1, 0), ""))), /outside the source/);
+    assert.throws(() => applySvndiff(Buffer.alloc(0), delta(0, window(0, 0, 4, op(1, 4, 0), ""))), /unwritten target/);
+    assert.throws(() => applySvndiff(Buffer.alloc(0), delta(0, window(0, 0, 5, op(2, 2), "ab"))), /shorter/);
+    assert.throws(() => applySvndiff(Buffer.alloc(0), delta(0, window(0, 0, 2, op(2, 2), "ab")).subarray(0, 8)), /truncated/);
+    // A window that claims a huge target (a few bytes of instructions can) is refused before allocating it.
+    assert.throws(() => applySvndiff(Buffer.alloc(0), delta(0, window(0, 0, MAX_TEXT + 1, [...op(2, 1), ...op(1, MAX_TEXT, 0)], "a"))), /over/);
+  });
+});
+
+describe("parseFileRevs / PageTexts", function () {
+  // Captured from mod_dav_svn 1.14 (the test server): a.txt added in r2, line 2 edited in r3, renamed in r9.
+  const lines30 = Array.from({ length: 30 }, (_, i) => `line ${i + 1}\n`).join("");
+  const r3 = lines30.replace("line 2\n", "line 2 r3\n");
+  const xml =
+    '<?xml version="1.0" encoding="utf-8"?>\n<S:file-revs-report xmlns:S="svn:" xmlns:D="DAV:">\n' +
+    '<S:file-rev path="/trunk/a.txt" rev="2">\n<S:rev-prop name="svn:author">alice</S:rev-prop>\n' +
+    `<S:txdelta>${Buffer.concat([Buffer.from("U1ZOAAAAgWcDgWeAgWc=", "base64"), Buffer.from(lines30)]).toString("base64")}</S:txdelta></S:file-rev>\n` +
+    '<S:file-rev path="/trunk/a.txt" rev="3">\n<S:txdelta>U1ZOAACBZ4FqBwMNAIMAgVoNIHIz</S:txdelta></S:file-rev>\n' +
+    '<S:file-rev path="/trunk/b.txt" rev="9">\n<S:rev-prop name="svn:log">rename</S:rev-prop>\n</S:file-rev>\n' +
+    "</S:file-revs-report>\n";
+
+  it("rebuilds each revision's text from the deltas; no delta means unchanged", function () {
+    const revs = parseFileRevs(xml);
+    assert.deepStrictEqual(revs.map((r) => [r.rev, r.path, !!r.delta]), [[2, "/trunk/a.txt", true], [3, "/trunk/a.txt", true], [9, "/trunk/b.txt", false]]);
+    const texts = textsOf(revs).map(String);
+    assert.deepStrictEqual(texts, [lines30, r3, r3]);
+    assert.throws(() => parseFileRevs("<S:log-report/>"), /Unexpected/);
+  });
+
+  /** A delta that writes `text` whatever the source (valid against any source). */
+  const whole = (text: string) => {
+    const t = Buffer.from(text);
+    const n = (x: number): number[] => (x < 128 ? [x] : [...n(Math.floor(x / 128)).map((b, i, a) => (i === a.length - 1 ? b | 0x80 : b)), x & 0x7f]);
+    const ins = [0x80, ...n(t.length)]; // new data, length in the next number
+    return Buffer.concat([Buffer.from("SVN\0", "latin1"), Buffer.from([...n(0), ...n(0), ...n(t.length), ...n(ins.length), ...n(t.length)]), Buffer.from(ins), t]);
+  };
+  // Newest first, as the walk asks for them: r9 (b.txt, r3's text), r3 (no delta: same), r2.
+  const newestFirst = () => [
+    { rev: 9, path: "/trunk/b.txt", delta: whole(r3) },
+    { rev: 3, path: "/trunk/a.txt" },
+    { rev: 2, path: "/trunk/a.txt", delta: whole(lines30) },
+  ];
+
+  it("gives the text at a revision: the newest delivered at or before it, on the same path, within the page", function () {
+    const t = new PageTexts(newestFirst(), 12);
+    assert.strictEqual(t.textAt(13, "trunk/b.txt"), undefined, "past the page");
+    assert.strictEqual(t.textAt(12, "trunk/b.txt")?.text, r3);
+    assert.strictEqual(t.textAt(10, "trunk/a.txt"), undefined, "another path: fetched to be sure");
+    assert.strictEqual(t.textAt(8, "/trunk/a.txt")?.text, r3, "r8 is still r3's text");
+    assert.strictEqual(t.textAt(2, "trunk/a.txt")?.text, lines30);
+    assert.strictEqual(t.textAt(1, "trunk/a.txt"), undefined, "before the oldest delivered revision");
+  });
+
+  it("only goes back in time: a newer text after an older one misses (the walk GETs it)", function () {
+    const revs = newestFirst();
+    const t = new PageTexts(revs, 12);
+    assert.strictEqual(t.textAt(2, "trunk/a.txt")?.text, lines30);
+    assert.strictEqual(t.textAt(9, "trunk/b.txt"), undefined);
+    assert.strictEqual(t.textAt(2, "trunk/a.txt")?.text, lines30, "the current one can be asked again");
+    assert.ok(revs.every((r) => r.delta === undefined), "applied deltas are dropped");
+  });
+
+  it("after a delta that can't be applied, only misses (walk states share it; a half-advanced cursor would give a wrong text)", function () {
+    const t = new PageTexts([
+      { rev: 30, path: "/f", delta: whole("r30\n") },
+      { rev: 20, path: "/f", delta: Buffer.from("SVN\x07", "latin1") },
+      { rev: 10, path: "/f", delta: whole("r10\n") },
+    ], 30);
+    assert.strictEqual(t.textAt(30, "f")?.text, "r30\n");
+    assert.throws(() => t.textAt(20, "f"), /version 7/);
+    assert.strictEqual(t.textAt(20, "f"), undefined);
+    assert.strictEqual(t.textAt(25, "f"), undefined);
+    assert.strictEqual(t.textAt(10, "f"), undefined);
+  });
+
+  it("refuses a list that isn't strictly newest first", function () {
+    assert.throws(() => new PageTexts([{ rev: 3, path: "/f" }, { rev: 5, path: "/f" }], 5), /newest-first/);
+    assert.throws(() => new PageTexts([{ rev: 5, path: "/f" }, { rev: 5, path: "/f" }], 5), /newest-first/);
   });
 });

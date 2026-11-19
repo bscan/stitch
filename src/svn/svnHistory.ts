@@ -10,7 +10,9 @@ import { ChangedFile, Commit } from "../backend";
 import { decodeText, LineSpan, mapRange } from "../history/patch";
 import { Filters, matchesFilters } from "../history/scope";
 import { HistorySource, Incoming, Level, Next, SourcePage, TopPage } from "../history/source";
-import { ChangedPath, DavClient, DavError, LogItem, RepoInfo } from "./dav";
+import { log } from "../log";
+import { ChangedPath, DavClient, DavError, FileRev, LogItem, RepoInfo } from "./dav";
+import { applySvndiff } from "./svndiff";
 
 interface At {
   /** Absolute repository path ("/trunk/a.txt"). */
@@ -206,9 +208,9 @@ export interface SvnQuery {
 const SCAN_PAGE = 100;
 /** How many revisions one search step (until "Search further") may look at: author or message… */
 export const SCAN_CAP = 1000;
-/** …and lines, where each revision costs a GET. A line search always finds the revision that added the lines, so this is only a safety limit… */
+/** …and lines, where each revision costs a text (a delta, or a GET on servers without file-revs). A line search always finds the revision that added the lines, so this is only a safety limit… */
 export const LINES_CAP = 1000;
-/** A line search looks at least this many revisions per step (about 3 s at 14 ms a GET)… */
+/** A line search looks at least this many revisions per step (4 file-revs-reports, or 200 GETs: about 3 s at 14 ms each)… */
 export const LINES_MIN = 200;
 /** …and, past that, this many after its first match (related changes tend to be close together). */
 export const LINES_AFTER_MATCH = 20;
@@ -227,7 +229,71 @@ interface Walk {
   at?: At;
   text?: string;
   range: LineSpan;
+  /** The texts of the queue's revisions and their predecessors, from one file-revs-report per log page. */
+  texts?: PageTexts;
 }
+
+/**
+ * A log page's texts, from a newest-first file-revs-report: the newest as a delta
+ * against empty, each older one as a delta against the one before it. They cover
+ * every revision from the oldest delivered up to `high`: the file's text at r is
+ * that of the newest delivered revision at or before r.
+ *
+ * Memory: only the current text is held, plus the deltas not applied yet. The walk
+ * only goes back in time, so the texts are rebuilt as it asks, and each delta is
+ * dropped once applied. Asking for a newer text than the last one asked misses
+ * (the caller GETs it): that happens when a saved walk state is served again.
+ */
+export class PageTexts {
+  private i = -1;
+  private cur = Buffer.alloc(0);
+  /** A delta failed to apply: the cursor can't be trusted, so every later call misses. */
+  private broken = false;
+
+  /** `revs`: newest first, strictly (anything else is a protocol error: lookups rely on it). */
+  constructor(
+    private readonly revs: FileRev[],
+    readonly high: number
+  ) {
+    if (revs.some((r, k) => k > 0 && r.rev >= revs[k - 1].rev)) {
+      throw new DavError("The server's file-revs-report isn't in newest-first order", "protocol");
+    }
+  }
+
+  /**
+   * The file's text at `rev` (at `path` then; undefined: binary), or undefined when the page
+   * can't say (fetch it). Throws when a delta can't be applied; the instance then only misses
+   * (walk states share it, so a state saved earlier must not get a half-advanced cursor).
+   */
+  textAt(rev: number, path: string): { text: string | undefined } | undefined {
+    if (this.broken || rev > this.high) return undefined;
+    // The newest delivered revision at or before `rev`; one the walk has already passed can't be rebuilt.
+    const j = this.revs.findIndex((r) => r.rev <= rev);
+    if (j < 0 || j < this.i) return undefined;
+    // The same line of history as the log follows; a different path means it isn't (fetch to be sure).
+    if (strip(this.revs[j].path) !== strip(path)) return undefined;
+    while (this.i < j) {
+      const r = this.revs[this.i + 1];
+      try {
+        if (r.delta) this.cur = applySvndiff(this.cur, r.delta);
+      } catch (e) {
+        this.broken = true;
+        throw e;
+      }
+      this.i++;
+      r.delta = undefined;
+    }
+    return { text: decodeText(this.cur) };
+  }
+}
+
+/** Per client: repository roots whose server failed a file-revs-report; line searches there GET each revision instead. */
+const noFileRevs = new WeakMap<DavClient, Set<string>>();
+const failedRoots = (client: DavClient) => {
+  let set = noFileRevs.get(client);
+  if (!set) noFileRevs.set(client, (set = new Set()));
+  return set;
+};
 
 /**
  * The file's path in a merged revision. The merged revisions are on the merge
@@ -435,7 +501,7 @@ export class SvnSource implements HistorySource {
 
   /**
    * Looks at the next few revisions of a line search, newest first: each one's text
-   * against its predecessor's (one GET each), keeping the revisions that changed the
+   * against its predecessor's (from the page's file-revs-report, else a GET), keeping the revisions that changed the
    * lines and following the lines back. The search ends when every line was added.
    */
   private async walkStep(id: number, signal?: AbortSignal): Promise<SourcePage> {
@@ -451,7 +517,18 @@ export class SvnSource implements HistorySource {
     let scanned = 0;
     let through = "";
     let done = false;
-    const text = async (rev: string, p: string) => decodeText(await this.client.get(this.info, Number(rev), p, {}, signal));
+    const text = async (rev: string, p: string) => {
+      let known: { text: string | undefined } | undefined;
+      try {
+        known = w.texts?.textAt(Number(rev), p);
+      } catch (e) {
+        // A delta Stitch can't apply: this page and later searches here GET instead.
+        this.fileRevsFailed(e);
+        w.texts = undefined;
+      }
+      if (known) return known.text;
+      return decodeText(await this.client.get(this.info, Number(rev), p, {}, signal));
+    };
     while (scanned < LINES_STEP) {
       if (w.queue.length === 0) {
         if (!w.at) {
@@ -461,6 +538,7 @@ export class SvnSource implements HistorySource {
         const page = await this.page(w.at, 50, signal);
         w.queue = page.commits;
         w.at = page.next as At | undefined;
+        w.texts = await this.pageTexts(w.queue, signal);
         if (w.queue.length === 0) {
           done = true;
           break;
@@ -497,6 +575,38 @@ export class SvnSource implements HistorySource {
       w.range = m.range;
     }
     return { commits: kept, next: done ? undefined : { walk: this.saveWalk(w) }, searched: { scanned, through } };
+  }
+
+  /**
+   * The texts a log page's line search needs, in one newest-first file-revs-report:
+   * from the newest revision down to the oldest one's predecessor. Undefined when the
+   * server can't send it newest first, or failed before (then each revision is a GET).
+   */
+  private async pageTexts(queue: Commit[], signal?: AbortSignal): Promise<PageTexts | undefined> {
+    const newest = queue[0];
+    const oldest = queue[queue.length - 1];
+    if (!newest || !this.info.reverseFileRevs || failedRoots(this.client).has(this.info.rootUrl)) return undefined;
+    const high = Number(newest.rev);
+    const low = Number(oldest.parents[0] ?? oldest.rev);
+    try {
+      return new PageTexts(await this.client.fileRevs(this.info, newest.path, high, low, signal), high);
+    } catch (e) {
+      if (e instanceof DavError && e.kind === "cancelled") throw e;
+      this.fileRevsFailed(e);
+      return undefined;
+    }
+  }
+
+  /**
+   * After a failed file-revs-report: this client doesn't ask this repository again, and
+   * its line searches GET each revision. A dropped connection only costs that page its
+   * report. A timeout counts as a failure: the report is bigger than a GET and would
+   * time out again on every page, each time after the full wait.
+   */
+  private fileRevsFailed(e: unknown): void {
+    const transient = e instanceof DavError && e.kind === "unreachable";
+    if (!transient) failedRoots(this.client).add(this.info.rootUrl);
+    log.warn(`file-revs-report failed (${(e as Error).message}); ${transient ? "this page fetches" : `line searches on ${this.info.rootUrl} fetch`} each revision instead`);
   }
 
   private saveWalk(w: Walk): number {

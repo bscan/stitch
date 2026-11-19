@@ -1,19 +1,21 @@
 // Read-only client for Subversion's HTTP protocol (HTTPv2, servers 1.7+).
 //
 // Every network call goes through request(), which allows only the methods
-// OPTIONS, GET and REPORT, and only the log-report REPORT. Anything else
+// OPTIONS, GET and REPORT, and only the log-report and file-revs-report REPORTs
+// (both read-only: svn log and svn blame use them). Anything else
 // (PUT, MKACTIVITY, CHECKOUT, MERGE, PROPPATCH, LOCK, …) throws before a
 // connection is made. Uses Node's http/https, which VS Code patches so the
 // user's proxy settings and system certificates apply.
 import * as http from "http";
 import * as https from "https";
 import { bytes, elapsed, log } from "../log";
+import { applySvndiff } from "./svndiff";
 import { encodeReposPath } from "./svnBackend";
 import { child, parseXml, textOf, XmlElement } from "./xml";
 
 export const ALLOWED_METHODS = ["OPTIONS", "GET", "REPORT"] as const;
 export type Method = (typeof ALLOWED_METHODS)[number];
-export const ALLOWED_REPORTS = ["log-report"];
+export const ALLOWED_REPORTS = ["log-report", "file-revs-report"];
 
 export type DavErrorKind = "readonly" | "unreachable" | "timeout" | "cancelled" | "auth" | "notFound" | "tooOld" | "http" | "protocol";
 
@@ -165,6 +167,8 @@ export interface RepoInfo {
   youngest: number;
   /** Absolute URL of the revision-root stub ("…/!svn/rvr"). */
   revRootStub: string;
+  /** The server sends a file-revs-report newest first when asked (DAV: …/reverse-file-revs). */
+  reverseFileRevs?: boolean;
 }
 
 export type ChangedPath = {
@@ -278,6 +282,50 @@ export function logReportBody(o: LogOptions): string {
   );
 }
 
+/**
+ * One revision of a file-revs-report: the file's path then, and its text as an svndiff
+ * against the text of the revision delivered before it (the first: against empty).
+ * No delta: the same text as before (a rename, a property change).
+ */
+export interface FileRev {
+  rev: number;
+  /** Absolute repository path ("/trunk/a.txt"). */
+  path: string;
+  delta?: Buffer;
+}
+
+export function fileRevsBody(start: number, end: number): string {
+  return (
+    '<?xml version="1.0" encoding="utf-8"?>' +
+    '<S:file-revs-report xmlns:S="svn:">' +
+    `<S:start-revision>${start}</S:start-revision>` +
+    `<S:end-revision>${end}</S:end-revision>` +
+    "<S:path></S:path>" +
+    "</S:file-revs-report>"
+  );
+}
+
+/** The revisions of a file-revs-report in the order delivered, with their deltas, not applied (svnHistory's PageTexts applies them as needed). */
+export function parseFileRevs(xml: string): FileRev[] {
+  const report = parseXml(xml).children.find((c) => c.name === "file-revs-report");
+  if (!report) throw new DavError("Unexpected file-revs response from the server", "protocol");
+  const out: FileRev[] = [];
+  for (const el of report.children) {
+    if (el.name !== "file-rev") continue;
+    const rev = parseInt(el.attrs.rev ?? "", 10);
+    if (!Number.isFinite(rev)) throw new DavError("Unexpected file-revs response from the server", "protocol");
+    const delta = child(el, "txdelta");
+    out.push({ rev, path: el.attrs.path ?? "", delta: delta ? Buffer.from(delta.text.replace(/\s+/g, ""), "base64") : undefined });
+  }
+  return out;
+}
+
+/** Every revision's full text, applying the deltas in order (each against the one before). Holds them all: tests. */
+export function textsOf(revs: FileRev[]): Buffer[] {
+  let text = Buffer.alloc(0);
+  return revs.map((r) => (text = r.delta ? applySvndiff(text, r.delta) : text));
+}
+
 export class DavClient {
   private readonly infos = new Map<string, { p: Promise<RepoInfo>; failedAt?: number }>();
   /** Per repository root: the youngest revision in the last OPTIONS answer, and when it came. */
@@ -328,6 +376,7 @@ export class DavClient {
       uuid,
       youngest: parseInt(h("svn-youngest-rev") ?? "0", 10),
       revRootStub: origin + stub,
+      reverseFileRevs: /\/reverse-file-revs\b/.test([res.headers.dav ?? []].flat().join(",")),
     };
     this.seen.set(info.rootUrl, { rev: info.youngest, at: Date.now() });
     return info;
@@ -353,6 +402,23 @@ export class DavClient {
     const url = this.revUrl(info, peg, path);
     const res = check(await request("REPORT", url, { body: logReportBody(o), timeoutMs: this.timeoutMs(), signal }), `log of ${path}@${peg}`);
     return parseLogReport(res.body.toString("utf8"));
+  }
+
+  /**
+   * `svn blame`'s request: the file's revisions between `start` and `end` (copies
+   * followed back), down to the last change at or before the lower one, with each
+   * one's text as stored (keywords contracted, like get() without `keywords`). One
+   * request instead of a GET per revision; the texts come as deltas. Delivered in the
+   * order asked: `start > end` is newest first (servers with `reverseFileRevs`).
+   * `path` is the file's path at the higher revision.
+   */
+  async fileRevs(info: RepoInfo, path: string, start: number, end: number, signal?: AbortSignal): Promise<FileRev[]> {
+    const peg = Math.max(start, end);
+    const res = check(
+      await request("REPORT", this.revUrl(info, peg, path), { body: fileRevsBody(start, end), timeoutMs: this.timeoutMs(), signal }),
+      `revisions of ${path}@${peg}`
+    );
+    return parseFileRevs(res.body.toString("utf8"));
   }
 
   /**
